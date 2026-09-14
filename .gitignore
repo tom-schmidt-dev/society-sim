@@ -1,0 +1,16 @@
+# Lokale Sprachmodelle und Gewichte
+models/
+*.bin
+*.gguf
+*.safetensors
+
+# Simulations-Logs
+logs/
+*.jsonl
+
+# Python-Umgebung und Caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
