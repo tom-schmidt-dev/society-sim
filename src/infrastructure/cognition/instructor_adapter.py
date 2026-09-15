@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, Optional, cast
 import instructor
 import litellm
-import json
 
-from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.models.cognition import (
     BlockedResolution,
-    NonVerbalBlockedResolution,
     DialogueResolution,
     GoalDecision,
     GoalEvaluation,
-    TalkAction,
+    ImpassableNonVerbalBlockedResolution,
+    NonVerbalBlockedResolution,
+    PostInspectionBlockedResolution,
+    ProbeOnlyBlockedResolution,
+    TalkOnlyBlockedResolution,
 )
+from src.domain.ports.cognition_provider import ICognitionProvider
 
 
 class InstructorCognitionAdapter(ICognitionProvider):
@@ -22,7 +25,7 @@ class InstructorCognitionAdapter(ICognitionProvider):
         model_name: str = "ollama/llama3",
         api_base: Optional[str] = None,
         api_key: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: float = 0.2,
         blockage_strategy: Literal["action_masking", "reflection"] = "action_masking",
     ) -> None:
         self._model_name = model_name
@@ -78,17 +81,112 @@ class InstructorCognitionAdapter(ICognitionProvider):
 
     async def resolve_blockage(self, context: dict[str, Any]) -> BlockedResolution:
         allow_talk = context.get("allow_talk", True)
+        allow_probe = context.get("allow_probe", True)
         inspected = context.get("blocker_inspected", False)
+        blocker_id = context.get("blocker_id")
 
-        # STRATEGIE A1: Dynamisches Action-Masking
+        # 1. Epistemisch vollständig erschöpft: Weder Sprache noch Tastung offen
+        if not allow_talk and not allow_probe:
+            system_prompt = (
+                "Du steuerst einen Agenten bei einer unüberwindbaren Blockade.\n\n"
+                "Das Hindernis ist bereits vollständig erprobt: Es reagiert nicht auf Sprache und ist unpassierbar.\n"
+                "Aktionen wie 'talk', 'inspect' und 'probe' sind unzulässig.\n\n"
+                "Handlungsanweisungen:\n"
+                "- Wähle 'reroute' (falls can_reroute True), um einen Alternativweg zu berechnen.\n"
+                "- Wähle 'wait', falls du warten möchtest.\n"
+                "- Formuliere deine Begründung im Feld 'thought'."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+            ]
+            params = self._build_request_params(ImpassableNonVerbalBlockedResolution, messages)
+            res_imp: ImpassableNonVerbalBlockedResolution = await self._client.chat.completions.create(**params)
+            return BlockedResolution(
+                thought=res_imp.thought,
+                action=res_imp.action,
+                new_sub_goal=res_imp.new_sub_goal,
+                complete_sub_goal=res_imp.complete_sub_goal,
+            )
+
+        # 2. Inspiziert, aber noch mindestens ein Kanal offen
+        if inspected:
+            # Fall A: Beide Kanäle offen (talk und probe)
+            if allow_talk and allow_probe:
+                system_prompt = (
+                    "Du steuerst einen Agenten bei einer Blockade.\n\n"
+                    f"Das Hindernis wurde inspiziert. Ein erneutes 'inspect' ist NICHT zulässig.\n"
+                    "Ebenso sind 'reroute' und 'wait' unzulässig, solange das Hindernis nicht vollständig erprobt ist.\n\n"
+                    "Handlungsanweisungen:\n"
+                    f"- Wähle 'probe' (target_agent_id='{blocker_id}'), um die Passierbarkeit durch Tasten zu prüfen.\n"
+                    f"- Wähle 'talk' (target_agent_id='{blocker_id}'), um das Gegenüber anzusprechen.\n"
+                    "- Formuliere deine Begründung im Feld 'thought'."
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+                ]
+                params = self._build_request_params(PostInspectionBlockedResolution, messages)
+                res_post: PostInspectionBlockedResolution = await self._client.chat.completions.create(**params)
+                return BlockedResolution(
+                    thought=res_post.thought,
+                    action=res_post.action,
+                    new_sub_goal=res_post.new_sub_goal,
+                    complete_sub_goal=res_post.complete_sub_goal,
+                )
+
+            # Fall B: Nur noch Erprobung offen (bereits als stumm verifiziert)
+            if allow_probe and not allow_talk:
+                system_prompt = (
+                    "Du steuerst einen Agenten bei einer Blockade.\n\n"
+                    "Das Gegenüber reagiert nicht auf Sprache. Das Hindernis ist jedoch physisch noch nicht erprobt.\n"
+                    "Aktionen wie 'talk', 'wait' und 'reroute' sind unzulässig.\n\n"
+                    f"- Wähle zwingend 'probe' (target_agent_id='{blocker_id}'), um die Passierbarkeit zu testen.\n"
+                    "- Formuliere deine Begründung im Feld 'thought'."
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+                ]
+                params = self._build_request_params(ProbeOnlyBlockedResolution, messages)
+                res_probe: ProbeOnlyBlockedResolution = await self._client.chat.completions.create(**params)
+                return BlockedResolution(
+                    thought=res_probe.thought,
+                    action=res_probe.action,
+                    new_sub_goal=res_probe.new_sub_goal,
+                    complete_sub_goal=res_probe.complete_sub_goal,
+                )
+
+            # Fall C: Nur noch Sprache offen (bereits physisch erprobt)
+            if allow_talk and not allow_probe:
+                system_prompt = (
+                    "Du steuerst einen Agenten bei einer Blockade.\n\n"
+                    "Die physische Passierbarkeit ist bereits erprobt. Der verbale Kanal ist noch offen.\n"
+                    "Aktionen wie 'probe', 'wait' und 'reroute' sind unzulässig.\n\n"
+                    f"- Wähle 'talk' (target_agent_id='{blocker_id}'), um mit dem Gegenüber zu interagieren.\n"
+                    "- Formuliere deine Begründung im Feld 'thought'."
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+                ]
+                params = self._build_request_params(TalkOnlyBlockedResolution, messages)
+                res_talk: TalkOnlyBlockedResolution = await self._client.chat.completions.create(**params)
+                return BlockedResolution(
+                    thought=res_talk.thought,
+                    action=res_talk.action,
+                    new_sub_goal=res_talk.new_sub_goal,
+                    complete_sub_goal=res_talk.complete_sub_goal,
+                )
+
+        # 3. Nicht inspiziert und keine Sprachoption
         if not allow_talk and self._blockage_strategy == "action_masking":
             system_prompt = (
-                "Du steuerst einen Agenten in einer 2D-Grid-Simulation bei einer Blockade.\n\n"
-                "Die blockierende Entität spricht nicht oder reagiert nicht. Verbale Kommunikation ('talk') steht nicht zur Auswahl.\n\n"
+                "Du steuerst einen Agenten bei einer Blockade. Verbale Kommunikation ('talk') steht nicht zur Auswahl.\n\n"
                 "Handlungsanweisungen:\n"
-                f"- Ist 'blocker_inspected' False: Wähle bevorzugt 'inspect' (target_agent_id='{context.get('blocker_id')}'), "
-                "um den Typ der Entität zu analysieren und Schlussfolgerungen für ähnliche Objekte zu ziehen.\n"
-                "- Ist das Objekt bereits inspiziert oder bekannt unpassierbar: Wähle 'reroute' (falls can_reroute True) oder 'wait'.\n"
+                f"- Da das Objekt noch nicht inspiziert ist: Wähle bevorzugt 'inspect' (target_agent_id='{blocker_id}'), "
+                "um Typ und Identität festzustellen.\n"
+                f"- Wähle 'probe' (target_agent_id='{blocker_id}'), falls du direkt die Passierbarkeit prüfen willst.\n"
                 "- Formuliere deine Begründung im Feld 'thought'."
             )
             messages = [
@@ -96,64 +194,29 @@ class InstructorCognitionAdapter(ICognitionProvider):
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
             ]
             params = self._build_request_params(NonVerbalBlockedResolution, messages)
-            res: NonVerbalBlockedResolution = await self._client.chat.completions.create(**params)
+            res_nonv: NonVerbalBlockedResolution = await self._client.chat.completions.create(**params)
             return BlockedResolution(
-                thought=res.thought,
-                action=res.action,
-                new_sub_goal=res.new_sub_goal,
-                complete_sub_goal=res.complete_sub_goal,
+                thought=res_nonv.thought,
+                action=res_nonv.action,
+                new_sub_goal=res_nonv.new_sub_goal,
+                complete_sub_goal=res_nonv.complete_sub_goal,
             )
 
-        # STRATEGIE A3: Kognitive Selbstkorrektur / Reflexions-Schleife
-        elif not allow_talk and self._blockage_strategy == "reflection":
-            system_prompt = (
-                "Du steuerst einen Agenten in einer 2D-Grid-Simulation bei einer Blockade.\n\n"
-                "Verhaltensregeln:\n"
-                "- Prüfe den Eintrag 'blocker_memory_status' im Kontext:\n"
-                "  -> Falls 'blocker_inspected' False ist: Wähle 'inspect', um den Objekttyp zu ermitteln.\n"
-                "  -> Falls die Entität stumm oder unpassierbar ist: Sprich sie NICHT an. Wähle 'reroute' oder 'wait'.\n"
-                "- Formuliere deine Begründung im Feld 'thought'."
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
-            ]
-            params = self._build_request_params(BlockedResolution, messages)
-            resolution: BlockedResolution = await self._client.chat.completions.create(**params)
-
-            if isinstance(resolution.action, TalkAction):
-                messages.append({"role": "assistant", "content": resolution.model_dump_json()})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"KRITISCHER FEHLER: Du hast 'talk' gewählt, obwohl '{context.get('blocker_name')}' "
-                        f"nicht spricht oder als stumm eingestuft ist.\n"
-                        "Wähle 'inspect' (falls noch uninspiziert), 'reroute' oder 'wait'."
-                    ),
-                })
-                retry_params = self._build_request_params(BlockedResolution, messages)
-                resolution = await self._client.chat.completions.create(**retry_params)
-
-            return resolution
-
-        # Standardpfad: Verbale Interaktion potentiell möglich
-        else:
-            system_prompt = (
-                "Du steuerst einen Agenten in einer 2D-Grid-Simulation bei einer Blockade.\n\n"
-                "Verhaltensregeln:\n"
-                f"- Ist 'blocker_inspected' False: Es wird dringend empfohlen, die Entität zuerst per 'inspect' "
-                f"(target_agent_id='{context.get('blocker_id')}') zu analysieren, um ihren Typ und ihr Wesen zu bestimmen.\n"
-                "- Ist die Entität inspiziert und potentiell ansprechbar: Wähle 'talk'.\n"
-                "- 'target_agent_id' MUSS exakt der 'blocker_id' entsprechen.\n"
-                "- Wähle 'reroute' nur, wenn 'can_reroute' True ist.\n"
-                "- Formuliere deine Begründung im Feld 'thought'."
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
-            ]
-            params = self._build_request_params(BlockedResolution, messages)
-            return await self._client.chat.completions.create(**params)
+        # 4. Standard-Erstkontakt vor Inspektion
+        system_prompt = (
+            "Du steuerst einen Agenten in einer 2D-Grid-Simulation bei einer Blockade.\n\n"
+            "Handlungsanweisungen:\n"
+            f"- Da 'blocker_inspected' False ist: Wähle zwingend 'inspect' (target_agent_id='{blocker_id}'), "
+            "um den Typ der Entität oder Kachel zu ermitteln.\n"
+            f"- 'target_agent_id' MUSS exakt '{blocker_id}' entsprechen.\n"
+            "- Formuliere deine Begründung im Feld 'thought'."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+        ]
+        params = self._build_request_params(BlockedResolution, messages)
+        return await self._client.chat.completions.create(**params)
 
     async def evaluate_goal_status(self, context: dict[str, Any]) -> GoalEvaluation:
         system_prompt = (

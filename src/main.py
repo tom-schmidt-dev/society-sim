@@ -93,10 +93,12 @@ async def main() -> None:
         destination_name="Ost-Tor",
     )
 
+    # src/main.py
     stone = WorldEntity(
         id="stone_1",
         name="Großer Stein",
         position=Position(45, 22),
+        entity_type="rock",  # Expliziter Typ statt "generic"
         is_conversational=False,
     )
     container.engine.register_entity(stone)

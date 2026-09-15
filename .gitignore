@@ -4,6 +4,8 @@ models/
 *.gguf
 *.safetensors
 
+.idea/
+
 # Simulations-Logs
 logs/
 *.jsonl
