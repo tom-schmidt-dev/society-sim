@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Optional
 from src.application.services.action_executor import ActionExecutor
 from src.application.services.conflict_coordinator import ConflictCoordinator
+from src.application.services.critical_section_coordinator import CriticalSectionCoordinator
 from src.application.services.dialogue_coordinator import DialogueCoordinator
 from src.application.services.dialogue_history import DialogueHistory
 from src.application.services.dialogue_session_manager import DialogueSessionManager
@@ -41,6 +42,7 @@ class SimulationEngine:
         dialogue_history: Optional[DialogueHistory] = None,
         perception_service: Optional[PerceptionService] = None,
         target_search_service: Optional[TargetSearchService] = None,
+        critical_section_coordinator: Optional[CriticalSectionCoordinator] = None,
         auditory_radius: int = 3,
     ) -> None:
         self._entities: list[WorldEntity] = []
@@ -63,6 +65,10 @@ class SimulationEngine:
         )
         self._evasion_finder = EvasionFinder(pathfinder)
         self._session_manager = DialogueSessionManager(max_dialogue_turns=2)
+        self._critical_section_coordinator = (
+            critical_section_coordinator
+            or CriticalSectionCoordinator(logger=self._logger, tick_provider=lambda: self._current_tick)
+        )
 
         self._target_search_service = target_search_service or TargetSearchService(
             pathfinder=self._pathfinder,
@@ -78,6 +84,7 @@ class SimulationEngine:
             goal_service=self._goal_service,
             pathfinder=self._pathfinder,
             evasion_finder=self._evasion_finder,
+            critical_section_coordinator=self._critical_section_coordinator,
             tick_provider=lambda: self._current_tick,
         )
 
@@ -112,6 +119,10 @@ class SimulationEngine:
     @property
     def dialogue_history(self) -> DialogueHistory:
         return self._dialogue_history
+
+    @property
+    def critical_section_coordinator(self) -> CriticalSectionCoordinator:
+        return self._critical_section_coordinator
 
     def register_entity(self, entity: WorldEntity) -> None:
         if not self._grid.is_walkable(entity.position):
@@ -274,11 +285,32 @@ class SimulationEngine:
                         message="Danke fürs Platz machen!",
                     )
 
+    def _notify_next_critical_section_holder(self, resource_key: str, next_agent_id: str) -> None:
+        """Aktiviert den nächsten Agenten in der Warteschlange und stößt die Notwendigkeitsprüfung an."""
+        next_agent = next((a for a in self._agents if a.id == next_agent_id), None)
+        if not next_agent or not next_agent.active_goal:
+            return
+
+        is_completed = self._critical_section_coordinator.is_completed(resource_key)
+        is_still_needed = self._goal_service.validate_goal_necessity(
+            agent=next_agent,
+            goal=next_agent.active_goal,
+            is_already_completed=is_completed,
+            incident_id=f"cs-notify-t{self._current_tick}-{resource_key}",
+        )
+        if is_still_needed:
+            self._goal_service.resume_goal(next_agent)
+            if next_agent.active_goal and next_agent.active_goal.target_position:
+                new_path = self._pathfinder.find_path(
+                    next_agent.position, next_agent.active_goal.target_position, next_agent.mental_map
+                )
+                if new_path:
+                    next_agent.assign_path(new_path)
+
     async def process_tick(self) -> None:
         """Führt einen einzelnen Simulationszyklus deterministisch aus."""
         self._current_tick += 1
 
-        # 0. Temporäre Timed-Goals der Agenten dekrementieren
         for agent in self._entities:
             if isinstance(agent, Agent) and agent.active_goal:
                 self._goal_service.process_timed_goal(agent)
@@ -289,7 +321,6 @@ class SimulationEngine:
 
             agent: Agent = entity
 
-            # Prüfung auf Erreichbarkeit des Interaktionspartners (auditive Reichweite)
             if agent.interaction_partner_id:
                 partner_entity = next((e for e in self._entities if e.id == agent.interaction_partner_id), None)
                 if partner_entity:
@@ -310,7 +341,6 @@ class SimulationEngine:
                             )
                         )
 
-            # Verabschiedungs-Handshake prüfen
             if agent.has_bid_farewell and agent.interaction_partner_id:
                 partner_agent = next((e for e in self._entities if e.id == agent.interaction_partner_id and isinstance(e, Agent)), None)
                 if partner_agent and partner_agent.has_bid_farewell:
@@ -326,17 +356,12 @@ class SimulationEngine:
                     partner_agent.is_waiting_for_reply = False
                     partner_agent.interaction_partner_id = None
 
-            # 1. Posteingang verarbeiten
             if agent.inbox and not agent.is_thinking:
-
-                # 1a. Höflichkeits-Quittung und Nischen-Clearance
                 courtesy_msgs = [m for m in agent.inbox if m.is_courtesy]
                 for msg in courtesy_msgs:
                     agent.inbox.remove(msg)
                     agent.assimilate_message(msg, tick=self._current_tick)
-                    sender = next(
-                        (e for e in self._entities if e.id == msg.from_agent_id), None
-                    )
+                    sender = next((e for e in self._entities if e.id == msg.from_agent_id), None)
                     sender_id = sender.id if sender else msg.from_agent_id
                     sender_name = sender.name if sender else "Partner"
 
@@ -355,7 +380,7 @@ class SimulationEngine:
                         junction_pos = goal.junction_position
                         self._goal_service.pop_goal(agent)
                         while agent.active_goal and (
-                                "Warten" in agent.active_goal.name or "Konversation" in agent.active_goal.name
+                            "Warten" in agent.active_goal.name or "Konversation" in agent.active_goal.name
                         ):
                             self._goal_service.pop_goal(agent)
 
@@ -374,7 +399,6 @@ class SimulationEngine:
                             if new_path:
                                 agent.assign_path(new_path)
 
-                # 1. b)
                 halt_msgs = [m for m in agent.inbox if m.is_halt_request]
                 for msg in halt_msgs:
                     agent.inbox.remove(msg)
@@ -398,7 +422,10 @@ class SimulationEngine:
                                 break
 
                     fact = agent.memory.known_entities.get(msg.from_agent_id)
-                    if fact and fact.partner_planned_path and agent.has_path:
+                    if msg.correlation_key and msg.correlation_key.startswith("niche-entry"):
+                        if fact:
+                            fact.partner_planned_path = None
+                    elif fact and fact.partner_planned_path and agent.has_path:
                         partner_tiles = set(fact.partner_planned_path)
                         if set(agent.path) & partner_tiles:
                             self._replan_agent_path_avoiding(agent, partner_tiles)
@@ -442,7 +469,6 @@ class SimulationEngine:
                             )
                     continue
 
-                # 1e. Ausweich-Ankündigungen verarbeiten
                 evasion_notices = [m for m in agent.inbox if m.is_evasion_notice]
                 for msg in evasion_notices:
                     agent.inbox.remove(msg)
@@ -462,10 +488,10 @@ class SimulationEngine:
                         agent.assimilate_message(fm, tick=self._current_tick)
 
                     if agent.active_goal and (
-                            "In Nische ausweichen" in agent.active_goal.name or "Warten" in agent.active_goal.name):
+                        "In Nische ausweichen" in agent.active_goal.name or "Warten" in agent.active_goal.name
+                    ):
                         self._goal_service.pop_goal(agent, target_goal=agent.active_goal)
 
-                # Verabschiedungsechos konsumieren und wartenden Absender befreien
                 if not agent.interaction_partner_id:
                     farewell_echoes = [m for m in agent.inbox if m.is_farewell]
                     for msg in farewell_echoes:
@@ -473,7 +499,8 @@ class SimulationEngine:
                         agent.assimilate_message(msg, tick=self._current_tick)
                         sender = next(
                             (e for e in self._entities if e.id == msg.from_agent_id and isinstance(e, Agent)),
-                            None)
+                            None,
+                        )
                         if sender:
                             sender.has_bid_farewell = False
                             sender.peer_bid_farewell = False
@@ -494,7 +521,7 @@ class SimulationEngine:
                 task.add_done_callback(self._background_tasks.discard)
                 continue
 
-            # Abarbeitung der FIFO-Warteschlange mit Lazy Validation
+            # Abarbeitung der FIFO-Warteschlange mit Kognitions-Trigger
             while not agent.is_busy and agent.interaction_queue:
                 req = agent.interaction_queue.pop(0)
                 requester = next((e for e in self._entities if e.id == req.requester_id and isinstance(e, Agent)), None)
@@ -519,6 +546,14 @@ class SimulationEngine:
                             payload={"requester_id": requester.id, "distance": dist, "blocked_pos": [req.blocked_pos.x, req.blocked_pos.y]},
                         )
                     )
+                    requester.is_thinking = True
+                    task = asyncio.create_task(
+                        self._conflict_coordinator.resolve_blockage(
+                            requester, agent, req.blocked_pos, self._entities
+                        )
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
                     break
                 else:
                     self._logger.log(
@@ -536,7 +571,6 @@ class SimulationEngine:
                         )
                     )
 
-            # Epistemische Zielsuche für Ziele mit target_entity_id
             if (
                 not agent.is_busy
                 and agent.active_goal
@@ -553,7 +587,6 @@ class SimulationEngine:
                 if search_res.path:
                     agent.assign_path(search_res.path)
 
-            # Nischen-Ankunft prüfen (falls Agent bereits auf Nischenkachel steht)
             current_goal = agent.active_goal
             if (
                 current_goal is not None
@@ -564,11 +597,27 @@ class SimulationEngine:
             ):
                 self._handle_niche_arrival(agent, current_goal)
 
-            # 2. Blockierung der Fortbewegung
             if agent.is_thinking or agent.is_busy:
                 continue
 
-            # 3. Physischer Bewegungsschritt
+            # Zielabschluss und Notwendigkeitsprüfung am Ziel
+            if (
+                current_goal is not None
+                and current_goal.target_position is not None
+                and agent.position == current_goal.target_position
+                and not current_goal.is_evasion_hold
+                and current_goal.junction_position is None
+            ):
+                resource_key = f"pos:{current_goal.target_position.x},{current_goal.target_position.y}"
+                next_agent_id = self._critical_section_coordinator.release(
+                    agent_id=agent.id, resource_key=resource_key, mark_completed=True
+                )
+                self._goal_service.pop_goal(agent)
+                if next_agent_id:
+                    self._notify_next_critical_section_holder(resource_key, next_agent_id)
+                continue
+
+            # Physischer Bewegungsschritt
             if agent.has_path:
                 next_pos = agent.path[0]
                 is_walkable = self._grid.is_walkable(next_pos) and not any(

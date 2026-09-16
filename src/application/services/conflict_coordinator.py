@@ -64,16 +64,15 @@ class ConflictCoordinator(IConflictCoordinator):
                 if not agent.has_path or agent.path[0] != blocked_pos or blocker.position != blocked_pos:
                     return
 
-                # Abbruch, wenn der Blocker bereits eine Interaktion mit diesem Agenten begonnen hat
                 if agent.inbox and any(m.from_agent_id == blocker.id for m in agent.inbox):
                     return
                 if isinstance(blocker, Agent) and blocker.interaction_partner_id == agent.id:
                     return
 
                 is_busy_with_third_party = (
-                        isinstance(blocker, Agent)
-                        and blocker.interaction_partner_id is not None
-                        and blocker.interaction_partner_id != agent.id
+                    isinstance(blocker, Agent)
+                    and blocker.interaction_partner_id is not None
+                    and blocker.interaction_partner_id != agent.id
                 )
 
                 if is_busy_with_third_party:
@@ -100,7 +99,6 @@ class ConflictCoordinator(IConflictCoordinator):
                         )
                     return
 
-                # Vorfahrtsprüfung: Weicht der Blocker bereits für diesen Agenten aus?
                 if (
                     isinstance(blocker, Agent)
                     and (
@@ -110,7 +108,6 @@ class ConflictCoordinator(IConflictCoordinator):
                 ):
                     return
 
-                listening_goal: Optional[Goal] = None
                 if isinstance(blocker, Agent):
                     blocker.is_listening_to_peer = True
                     blocker.interaction_partner_id = agent.id
@@ -185,6 +182,7 @@ class ConflictCoordinator(IConflictCoordinator):
                             else "Bisher keine Erfahrungswerte zu diesem Typ"
                         )
 
+                    # Reduzierter Kontext für Kognitions-Provider (Kontextreduktion)
                     context = {
                         "agent_id": agent.id,
                         "name": agent.name,
@@ -210,7 +208,7 @@ class ConflictCoordinator(IConflictCoordinator):
                         "active_goal": agent.active_goal.to_dict() if agent.active_goal else None,
                         "can_reroute": bool(test_path),
                         "received_messages": received,
-                        "recent_dialogues": self._dialogue_history.get_recent_formatted(limit=6),
+                        "recent_dialogues": self._dialogue_history.get_recent_formatted(limit=3),
                     }
 
                     self._logger.log(

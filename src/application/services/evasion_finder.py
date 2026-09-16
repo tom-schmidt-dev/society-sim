@@ -136,16 +136,16 @@ class EvasionFinder:
         return None, came_from
 
     def _reconstruct_path(
-        self,
-        start: Position,
-        target: Position,
-        came_from: dict[Position, Position],
+            self,
+            start: Position,
+            target: Position,
+            came_from: dict[Position, Position],
     ) -> list[Position]:
         curr = target
-        path: list[Position] = [curr]
-        while curr in came_from and curr != start:
-            curr = came_from[curr]
+        path: list[Position] = []
+        while curr != start and curr in came_from:
             path.append(curr)
+            curr = came_from[curr]
         path.reverse()
         return path
 

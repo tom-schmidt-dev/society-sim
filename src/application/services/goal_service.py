@@ -13,11 +13,11 @@ from src.domain.ports.pathfinder import IPathfinder
 
 class GoalService:
     def __init__(
-            self,
-            logger: IEventLogger,
-            cognition_provider: ICognitionProvider,
-            pathfinder: IPathfinder,
-            tick_provider: Optional[Callable[[], int]] = None,
+        self,
+        logger: IEventLogger,
+        cognition_provider: ICognitionProvider,
+        pathfinder: IPathfinder,
+        tick_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         self._logger: IEventLogger = logger
         self._cognition_provider: ICognitionProvider = cognition_provider
@@ -25,10 +25,10 @@ class GoalService:
         self._tick_provider: Callable[[], int] = tick_provider or (lambda: 0)
 
     def push_goal(
-            self,
-            agent: Agent,
-            goal: Goal,
-            incident_id: Optional[str] = None,
+        self,
+        agent: Agent,
+        goal: Goal,
+        incident_id: Optional[str] = None,
     ) -> None:
         """Fügt dem Goal-Stack ein Ziel hinzu und erfasst das Ereignis mit dem aktuellen Tick."""
         agent.push_goal(goal)
@@ -47,10 +47,10 @@ class GoalService:
         )
 
     def pop_goal(
-            self,
-            agent: Agent,
-            target_goal: Optional[Goal] = None,
-            incident_id: Optional[str] = None,
+        self,
+        agent: Agent,
+        target_goal: Optional[Goal] = None,
+        incident_id: Optional[str] = None,
     ) -> Optional[Goal]:
         """Entfernt das spezifizierte (oder oberste) Ziel und erfasst das Ereignis mit dem aktuellen Tick."""
         completed = agent.pop_goal(target_goal=target_goal)
@@ -90,11 +90,39 @@ class GoalService:
             return True
         return False
 
+    def validate_goal_necessity(
+        self,
+        agent: Agent,
+        goal: Goal,
+        is_already_completed: bool,
+        incident_id: Optional[str] = None,
+    ) -> bool:
+        """Überprüft deterministisch, ob ein Ziel nach Fertigstellung durch einen anderen Agenten noch notwendig ist."""
+        if not is_already_completed:
+            return True
+
+        self._logger.log(
+            SimulationEvent(
+                tick=self._tick_provider(),
+                agent_id=agent.id,
+                event_type="goal_deemed_unnecessary",
+                summary=f"Agent {agent.name}: Ziel '{goal.name}' verworfen, da es bereits durch einen Partner abgeschlossen wurde.",
+                payload={
+                    "incident_id": incident_id,
+                    "discarded_goal": goal.to_dict(),
+                    "reason": "target_already_completed_by_peer",
+                },
+            )
+        )
+        self.pop_goal(agent, target_goal=goal, incident_id=incident_id)
+        agent.clear_path()
+        return False
+
     async def evaluate_sub_goal_completion(
-            self,
-            agent: Agent,
-            grid: WorldGrid,
-            recent_dialogues: list[str],
+        self,
+        agent: Agent,
+        grid: WorldGrid,
+        recent_dialogues: list[str],
     ) -> None:
         """Evaluiert kognitiv den Abschluss eines Teilziels und loggt mit dem tatsächlichen Abschluss-Tick."""
         start_tick = self._tick_provider()
@@ -104,7 +132,6 @@ class GoalService:
             agent.is_thinking = False
             return
 
-        # Physische Nischenhalteziele dürfen niemals kognitiv evaluiert oder gepoppt werden
         if target_sub_goal.is_evasion_hold or agent.is_evasion_locked:
             agent.is_thinking = False
             return
@@ -158,10 +185,10 @@ class GoalService:
             agent.is_thinking = False
 
     def pause_goal(
-            self,
-            agent: Agent,
-            target_goal: Optional[Goal] = None,
-            incident_id: Optional[str] = None,
+        self,
+        agent: Agent,
+        target_goal: Optional[Goal] = None,
+        incident_id: Optional[str] = None,
     ) -> Optional[Goal]:
         """Pausiert das spezifizierte (oder oberste aktive) Ziel für eine höherrangige Unterbrechung."""
         goal = target_goal or agent.active_goal
@@ -184,10 +211,10 @@ class GoalService:
         return None
 
     def resume_goal(
-            self,
-            agent: Agent,
-            target_goal: Optional[Goal] = None,
-            incident_id: Optional[str] = None,
+        self,
+        agent: Agent,
+        target_goal: Optional[Goal] = None,
+        incident_id: Optional[str] = None,
     ) -> Optional[Goal]:
         """Reaktiviert ein zuvor pausiertes Ziel."""
         goal_to_resume: Optional[Goal] = None

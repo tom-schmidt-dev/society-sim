@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Callable, Optional, Any
+from typing import Any, Callable, Optional
+from src.application.services.critical_section_coordinator import CriticalSectionCoordinator
 from src.application.services.dialogue_history import DialogueHistory
 from src.application.services.evasion_finder import EvasionFinder
 from src.application.services.goal_service import GoalService
@@ -33,6 +34,7 @@ class ActionExecutor:
         goal_service: GoalService,
         pathfinder: IPathfinder,
         evasion_finder: Optional[EvasionFinder] = None,
+        critical_section_coordinator: Optional[CriticalSectionCoordinator] = None,
         tick_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         self._grid = grid
@@ -42,6 +44,14 @@ class ActionExecutor:
         self._pathfinder = pathfinder
         self._evasion_finder = evasion_finder or EvasionFinder(pathfinder)
         self._tick_provider = tick_provider or (lambda: 0)
+        self._critical_section_coordinator = (
+            critical_section_coordinator
+            or CriticalSectionCoordinator(logger=self._logger, tick_provider=self._tick_provider)
+        )
+
+    @property
+    def critical_section_coordinator(self) -> CriticalSectionCoordinator:
+        return self._critical_section_coordinator
 
     def find_entity(
         self, target_id: str, all_entities: list[WorldEntity]
@@ -126,14 +136,14 @@ class ActionExecutor:
         )
 
     def execute_evasion(
-            self,
-            agent: Agent,
-            partner: Optional[WorldEntity],
-            blocked_pos: Position,
-            all_entities: list[WorldEntity],
-            incident_id: str,
-            thought: str,
-            sub_goal_name: Optional[str] = None,
+        self,
+        agent: Agent,
+        partner: Optional[WorldEntity],
+        blocked_pos: Position,
+        all_entities: list[WorldEntity],
+        incident_id: str,
+        thought: str,
+        sub_goal_name: Optional[str] = None,
     ) -> None:
         """Führt die Ausweichkaskade deterministisch aus."""
         occupied = {other.position for other in all_entities if other.id != agent.id}
@@ -141,7 +151,6 @@ class ActionExecutor:
         partner_fact = agent.memory.known_entities.get(partner_id) if partner_id else None
         partner_trajectory = partner_fact.partner_planned_path if partner_fact else None
 
-        # Richtungsvektor aus Bewegungsbeobachtung ermitteln
         search_dir: Optional[tuple[float, float]] = None
         if partner_fact:
             if partner_fact.last_observed_velocity != (0.0, 0.0):
@@ -161,7 +170,6 @@ class ActionExecutor:
         agent.is_waiting_for_reply = False
         agent.is_listening_to_peer = False
 
-        # Unterbrechung: Niedriger priorisiertes Ziel (COOPERATIVE oder ROUTINE) vor Ausweichen pausieren
         if agent.active_goal and agent.active_goal.priority > ExecutionPriority.URGENT:
             self._goal_service.pause_goal(agent, agent.active_goal, incident_id=incident_id)
 
@@ -246,7 +254,15 @@ class ActionExecutor:
         incident_id: str,
         current_tick: int,
     ) -> None:
-        """Erfasst Typ und Beschaffenheit einer Entität im Nahbereich."""
+        """Erfasst Typ und Beschaffenheit einer Entität im Nahbereich mit Critical-Section-Absicherung."""
+        resource_key = f"entity:{blocker.id}"
+        prio = agent.active_goal.priority if agent.active_goal else ExecutionPriority.ROUTINE
+        has_lock = self._critical_section_coordinator.acquire_or_queue(agent, resource_key, prio)
+
+        if not has_lock:
+            self._goal_service.pause_goal(agent, incident_id=incident_id)
+            return
+
         agent.memory.record_inspection(blocker.id, blocker.entity_type)
         if isinstance(blocker, Agent) or blocker.is_conversational:
             agent.memory.record_walkability_result(blocker.id, is_walkable=False)
@@ -273,6 +289,7 @@ class ActionExecutor:
                 },
             )
         )
+        self._critical_section_coordinator.release(agent.id, resource_key, mark_completed=True)
 
     def execute_probe(
         self,
@@ -281,7 +298,15 @@ class ActionExecutor:
         incident_id: str,
         current_tick: int,
     ) -> None:
-        """Erprobt physisch die Passierbarkeit eines Hindernisses."""
+        """Erprobt physisch die Passierbarkeit eines Hindernisses mit Critical-Section-Absicherung."""
+        resource_key = f"entity:{blocker.id}"
+        prio = agent.active_goal.priority if agent.active_goal else ExecutionPriority.ROUTINE
+        has_lock = self._critical_section_coordinator.acquire_or_queue(agent, resource_key, prio)
+
+        if not has_lock:
+            self._goal_service.pause_goal(agent, incident_id=incident_id)
+            return
+
         is_walkable = getattr(blocker, "is_passable", False)
         agent.memory.record_walkability_result(blocker.id, is_walkable=is_walkable)
         agent.memory.record_type_walkability(
@@ -289,9 +314,9 @@ class ActionExecutor:
         )
 
         if not is_walkable and (
-                not blocker.is_conversational
-                or not isinstance(blocker, Agent)
-                or agent.memory.get_assumed_conversational(blocker.id) is False
+            not blocker.is_conversational
+            or not isinstance(blocker, Agent)
+            or agent.memory.get_assumed_conversational(blocker.id) is False
         ):
             agent.mental_map.mark_obstacle(blocker.position, current_tick)
 
@@ -318,6 +343,7 @@ class ActionExecutor:
                 },
             )
         )
+        self._critical_section_coordinator.release(agent.id, resource_key, mark_completed=True)
 
     def execute_blockage_action(
         self,
@@ -371,8 +397,6 @@ class ActionExecutor:
             elif isinstance(target, Agent):
                 msg = self.create_talk_message(agent, action.message, intent=action.intent)
                 target.receive_message(msg)
-
-                # Zustands-Flags statt Goal-Stack
                 agent.is_waiting_for_reply = True
                 agent.interaction_partner_id = target.id
                 target.interaction_partner_id = agent.id
@@ -494,7 +518,6 @@ class ActionExecutor:
                 )
                 if isinstance(partner, Agent):
                     partner.peer_bid_farewell = True
-                    # Handshake vollenden, falls Partner verabschiedet ist, dieser Agent bereits ausweicht oder Partner den Dialog bereits beendet hat
                     if partner.has_bid_farewell or is_evading or not partner.interaction_partner_id:
                         agent.has_bid_farewell = False
                         agent.peer_bid_farewell = False
