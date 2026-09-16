@@ -71,7 +71,7 @@ async def main() -> None:
         destination_name="West-Tor",
     )
 
-    await container.engine.run(max_ticks=400)
+    await container.engine.run(max_ticks=200)
 
 
 if __name__ == "__main__":

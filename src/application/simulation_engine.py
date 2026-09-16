@@ -9,9 +9,11 @@ from src.application.services.dialogue_history import DialogueHistory
 from src.application.services.dialogue_session_manager import DialogueSessionManager
 from src.application.services.evasion_finder import EvasionFinder
 from src.application.services.goal_service import GoalService
+from src.application.services.target_search_service import TargetSearchService
 from src.domain.models.agent import Agent
 from src.domain.models.events import SimulationEvent
 from src.domain.models.goal import Goal
+from src.domain.models.message import IncomingMessage
 from src.domain.models.position import Position
 from src.domain.models.world import WorldGrid
 from src.domain.models.world_entity import WorldEntity
@@ -38,6 +40,8 @@ class SimulationEngine:
         dialogue_coordinator: Optional[IDialogueCoordinator] = None,
         dialogue_history: Optional[DialogueHistory] = None,
         perception_service: Optional[PerceptionService] = None,
+        target_search_service: Optional[TargetSearchService] = None,
+        auditory_radius: int = 3,
     ) -> None:
         self._entities: list[WorldEntity] = []
         self._grid: WorldGrid = grid
@@ -45,6 +49,7 @@ class SimulationEngine:
         self._presenter: IPresenter = presenter
         self._logger: IEventLogger = logger
         self._tick_interval: float = tick_interval
+        self._auditory_radius: int = auditory_radius
 
         self._agents: list[Agent] = []
         self._current_tick: int = 0
@@ -59,12 +64,20 @@ class SimulationEngine:
         self._evasion_finder = EvasionFinder(pathfinder)
         self._session_manager = DialogueSessionManager(max_dialogue_turns=2)
 
+        self._target_search_service = target_search_service or TargetSearchService(
+            pathfinder=self._pathfinder,
+            perception_service=self._perception_service,
+            evasion_finder=self._evasion_finder,
+            logger=self._logger,
+        )
+
         self._action_executor = ActionExecutor(
             grid=self._grid,
             logger=self._logger,
             dialogue_history=self._dialogue_history,
             goal_service=self._goal_service,
             pathfinder=self._pathfinder,
+            evasion_finder=self._evasion_finder,
             tick_provider=lambda: self._current_tick,
         )
 
@@ -165,7 +178,6 @@ class SimulationEngine:
         visible_positions = self._perception_service.get_visible_positions(agent.position, self._grid)
         for pos in visible_positions:
             tile_type = self._grid.get_tile_type(pos)
-            # Sichtbare statische Wände direkt als Hindernis erfassen
             if not self._grid.is_walkable(pos) or agent.memory.get_type_assumed_walkable(tile_type) is False:
                 agent.mental_map.mark_obstacle(pos, self._current_tick)
             else:
@@ -179,7 +191,6 @@ class SimulationEngine:
                 pos=visible_entity.position,
                 tick=self._current_tick,
             )
-            # Prinzip 3: Erst markieren, wenn physisch unpassierbar UND Sprache geklärt ist
             if (
                 agent.memory.is_epistemically_exhausted(visible_entity.id)
                 and agent.memory.get_assumed_walkable(visible_entity.id) is False
@@ -194,15 +205,285 @@ class SimulationEngine:
             discovered.update(agent.mental_map.tiles.keys())
         return discovered
 
-    def process_tick(self) -> None:
+    def _handle_niche_arrival(self, agent: Agent, current_goal: Goal) -> None:
+        """Überführt den Agenten deterministisch in den Nischen-Halt und benachrichtigt den Partner."""
+        junction = current_goal.junction_position
+        partner_id = current_goal.yield_for_agent_id
+
+        self._goal_service.pop_goal(agent)
+        agent.is_evasion_locked = True
+        agent.clear_path()
+
+        self._goal_service.push_goal(
+            agent,
+            Goal(
+                name="Nischen-Halt",
+                holds_position=True,
+                is_evasion_hold=True,
+                junction_position=junction,
+                yield_for_agent_id=partner_id,
+                description="Wartet in der Nische, bis der Partner den Chokepoint passiert hat.",
+            ),
+        )
+
+        partner = next((e for e in self._entities if e.id == partner_id), None)
+        if partner:
+            partner.receive_message(
+                IncomingMessage(
+                    from_agent_id=agent.id,
+                    from_agent_name=agent.name,
+                    message="Ok, weiter.",
+                    is_resume_signal=True,
+                    correlation_key=f"niche-entry-{agent.id}",
+                )
+            )
+
+    def _check_and_signal_clearance(self, agent: Agent) -> None:
+        """Prüft, ob dieser Agent den Chokepoint eines in der Nische wartenden Partners geräumt hat."""
+        for other in self._entities:
+            if not isinstance(other, Agent) or other.id == agent.id:
+                continue
+            other_goal = other.active_goal
+            if (
+                (other.is_evasion_locked or (other_goal and other_goal.is_evasion_hold))
+                and (other_goal and other_goal.yield_for_agent_id == agent.id)
+            ):
+                junction = other_goal.junction_position
+                if (
+                    junction is not None
+                    and agent.position != junction
+                    and junction not in agent.path
+                    and agent.position.manhattan_distance(junction) >= 2
+                ):
+                    other_goal.yield_for_agent_id = None
+                    other.receive_message(
+                        IncomingMessage(
+                            from_agent_id=agent.id,
+                            from_agent_name=agent.name,
+                            message="Danke fürs Platz machen!",
+                            is_courtesy=True,
+                            is_resume_signal=True,
+                        )
+                    )
+                    self._dialogue_history.record_dialogue(
+                        tick=self._current_tick,
+                        sender_id=agent.id,
+                        sender_name=agent.name,
+                        recipient_id=other.id,
+                        recipient_name=other.name,
+                        message="Danke fürs Platz machen!",
+                    )
+
+    async def process_tick(self) -> None:
+        """Führt einen einzelnen Simulationszyklus deterministisch aus."""
         self._current_tick += 1
 
-        for agent in self._agents:
-            if agent.energy > 0:
-                agent.energy -= 1
+        # 0. Temporäre Timed-Goals der Agenten dekrementieren
+        for agent in self._entities:
+            if isinstance(agent, Agent) and agent.active_goal:
+                self._goal_service.process_timed_goal(agent)
 
-            # 1. Posteingang hat Vorrang: Konversation auch während Haltezielen ausführen
+        for entity in list(self._entities):
+            if not isinstance(entity, Agent):
+                continue
+
+            agent: Agent = entity
+
+            # Prüfung auf Erreichbarkeit des Interaktionspartners (auditive Reichweite)
+            if agent.interaction_partner_id:
+                partner_entity = next((e for e in self._entities if e.id == agent.interaction_partner_id), None)
+                if partner_entity:
+                    dist = agent.position.manhattan_distance(partner_entity.position)
+                    if dist > self._auditory_radius:
+                        agent.is_waiting_for_reply = False
+                        agent.is_listening_to_peer = False
+                        agent.has_bid_farewell = False
+                        agent.peer_bid_farewell = False
+                        agent.interaction_partner_id = None
+                        self._logger.log(
+                            SimulationEvent(
+                                tick=self._current_tick,
+                                agent_id=agent.id,
+                                event_type="message_undeliverable",
+                                summary=f"Agent {agent.name}: Interaktionspartner {partner_entity.name} außer Hörweite. Wartezustand gelöst.",
+                                payload={"partner_id": partner_entity.id, "distance": dist},
+                            )
+                        )
+
+            # Verabschiedungs-Handshake prüfen
+            if agent.has_bid_farewell and agent.interaction_partner_id:
+                partner_agent = next((e for e in self._entities if e.id == agent.interaction_partner_id and isinstance(e, Agent)), None)
+                if partner_agent and partner_agent.has_bid_farewell:
+                    agent.has_bid_farewell = False
+                    agent.peer_bid_farewell = False
+                    agent.is_listening_to_peer = False
+                    agent.is_waiting_for_reply = False
+                    agent.interaction_partner_id = None
+
+                    partner_agent.has_bid_farewell = False
+                    partner_agent.peer_bid_farewell = False
+                    partner_agent.is_listening_to_peer = False
+                    partner_agent.is_waiting_for_reply = False
+                    partner_agent.interaction_partner_id = None
+
+            # 1. Posteingang verarbeiten
             if agent.inbox and not agent.is_thinking:
+
+                # 1a. Höflichkeits-Quittung und Nischen-Clearance
+                courtesy_msgs = [m for m in agent.inbox if m.is_courtesy]
+                for msg in courtesy_msgs:
+                    agent.inbox.remove(msg)
+                    agent.assimilate_message(msg, tick=self._current_tick)
+                    sender = next(
+                        (e for e in self._entities if e.id == msg.from_agent_id), None
+                    )
+                    sender_id = sender.id if sender else msg.from_agent_id
+                    sender_name = sender.name if sender else "Partner"
+
+                    self._dialogue_history.record_dialogue(
+                        tick=self._current_tick,
+                        sender_id=agent.id,
+                        sender_name=agent.name,
+                        recipient_id=sender_id,
+                        recipient_name=sender_name,
+                        message="Gern geschehen!",
+                    )
+
+                    agent.is_evasion_locked = False
+                    goal = agent.active_goal
+                    if goal is not None and (goal.is_evasion_hold or "Nischen-Halt" in goal.name):
+                        junction_pos = goal.junction_position
+                        self._goal_service.pop_goal(agent)
+                        while agent.active_goal and (
+                                "Warten" in agent.active_goal.name or "Konversation" in agent.active_goal.name
+                        ):
+                            self._goal_service.pop_goal(agent)
+
+                        self._goal_service.resume_goal(agent)
+
+                        active = agent.active_goal
+                        if active is not None and active.target_position:
+                            agent.mental_map.update_tile(agent.position, is_walkable=True, tick=self._current_tick)
+                            if junction_pos:
+                                agent.mental_map.update_tile(junction_pos, is_walkable=True, tick=self._current_tick)
+                            new_path = self._pathfinder.find_path(
+                                agent.position,
+                                active.target_position,
+                                agent.mental_map,
+                            )
+                            if new_path:
+                                agent.assign_path(new_path)
+
+                # 1. b)
+                halt_msgs = [m for m in agent.inbox if m.is_halt_request]
+                for msg in halt_msgs:
+                    agent.inbox.remove(msg)
+                    agent.assimilate_message(msg, tick=self._current_tick)
+                    agent.is_holding_for_junction = True
+
+                resume_msgs = [m for m in agent.inbox if m.is_resume_signal]
+                for msg in resume_msgs:
+                    agent.inbox.remove(msg)
+                    agent.assimilate_message(msg, tick=self._current_tick)
+                    agent.is_holding_for_junction = False
+
+                    if msg.correlation_key:
+                        self._goal_service.pop_goal_by_key(agent, msg.correlation_key)
+                    else:
+                        for i in range(len(agent.goals) - 1, -1, -1):
+                            if agent.goals[i].yield_for_agent_id == msg.from_agent_id:
+                                agent.goals.pop(i)
+                                if agent.goals:
+                                    agent.goals[-1].status = "active"
+                                break
+
+                    fact = agent.memory.known_entities.get(msg.from_agent_id)
+                    if fact and fact.partner_planned_path and agent.has_path:
+                        partner_tiles = set(fact.partner_planned_path)
+                        if set(agent.path) & partner_tiles:
+                            self._replan_agent_path_avoiding(agent, partner_tiles)
+
+                path_update_msgs = [m for m in agent.inbox if m.is_path_update]
+                if path_update_msgs:
+                    for msg in path_update_msgs:
+                        agent.inbox.remove(msg)
+                        agent.assimilate_message(msg, tick=self._current_tick)
+                        corr_key = msg.correlation_key or f"path-upd-{self._current_tick}"
+                        partner_path = msg.planned_path or []
+                        partner_tiles = set(partner_path)
+
+                        current_target_goal = agent.active_goal
+                        if current_target_goal and current_target_goal.target_position:
+                            if current_target_goal.target_position in partner_tiles:
+                                res = self._evasion_finder.find_nearest_evasion_tile(
+                                    start=agent.position,
+                                    blocked_pos=agent.position,
+                                    grid=agent.mental_map,
+                                    occupied_positions={e.position for e in self._entities if e.id != agent.id},
+                                    partner_trajectory=partner_path,
+                                )
+                                if res:
+                                    current_target_goal.target_position = res.target_tile
+                                    current_target_goal.junction_position = res.junction_tile
+                                    agent.assign_path(res.path)
+                            else:
+                                self._replan_agent_path_avoiding(agent, partner_tiles)
+
+                        sender = next((e for e in self._entities if e.id == msg.from_agent_id), None)
+                        if sender:
+                            sender.receive_message(
+                                IncomingMessage(
+                                    from_agent_id=agent.id,
+                                    from_agent_name=agent.name,
+                                    message="Ok, weiter.",
+                                    is_resume_signal=True,
+                                    correlation_key=corr_key,
+                                )
+                            )
+                    continue
+
+                # 1e. Ausweich-Ankündigungen verarbeiten
+                evasion_notices = [m for m in agent.inbox if m.is_evasion_notice]
+                for msg in evasion_notices:
+                    agent.inbox.remove(msg)
+                    agent.assimilate_message(msg, tick=self._current_tick)
+                    agent.is_waiting_for_reply = False
+                    agent.has_bid_farewell = False
+                    agent.peer_bid_farewell = False
+                    if agent.interaction_partner_id == msg.from_agent_id:
+                        agent.interaction_partner_id = None
+
+                    farewells_from_evader = [
+                        m for m in agent.inbox
+                        if m.from_agent_id == msg.from_agent_id and m.is_farewell
+                    ]
+                    for fm in farewells_from_evader:
+                        agent.inbox.remove(fm)
+                        agent.assimilate_message(fm, tick=self._current_tick)
+
+                    if agent.active_goal and (
+                            "In Nische ausweichen" in agent.active_goal.name or "Warten" in agent.active_goal.name):
+                        self._goal_service.pop_goal(agent, target_goal=agent.active_goal)
+
+                # Verabschiedungsechos konsumieren und wartenden Absender befreien
+                if not agent.interaction_partner_id:
+                    farewell_echoes = [m for m in agent.inbox if m.is_farewell]
+                    for msg in farewell_echoes:
+                        agent.inbox.remove(msg)
+                        agent.assimilate_message(msg, tick=self._current_tick)
+                        sender = next(
+                            (e for e in self._entities if e.id == msg.from_agent_id and isinstance(e, Agent)),
+                            None)
+                        if sender:
+                            sender.has_bid_farewell = False
+                            sender.peer_bid_farewell = False
+                            sender.is_waiting_for_reply = False
+                            sender.interaction_partner_id = None
+
+                if not agent.inbox:
+                    self._check_and_signal_clearance(agent)
+                    continue
+
                 agent.is_thinking = True
                 task = asyncio.create_task(
                     self._dialogue_coordinator.handle_incoming_dialogue(
@@ -213,103 +494,172 @@ class SimulationEngine:
                 task.add_done_callback(self._background_tasks.discard)
                 continue
 
-            # 2. Befristete Halteziele dekrementieren
-            if self._goal_service.process_timed_goal(agent):
-                continue
+            # Abarbeitung der FIFO-Warteschlange mit Lazy Validation
+            while not agent.is_busy and agent.interaction_queue:
+                req = agent.interaction_queue.pop(0)
+                requester = next((e for e in self._entities if e.id == req.requester_id and isinstance(e, Agent)), None)
+                if not requester:
+                    continue
 
-            # 3. Physische Blockade/Beschäftigung stoppt nur die Fortbewegung
-            if agent.is_busy:
-                continue
+                requester.is_waiting_for_reply = False
+                requester.interaction_partner_id = None
 
-            visible_entities = self._update_agent_perception(agent)
+                dist = agent.position.manhattan_distance(requester.position)
+                is_within_range = dist <= self._auditory_radius
+                is_still_heading_to_pos = requester.has_path and requester.path[0] == req.blocked_pos
+                is_agent_still_at_pos = agent.position == req.blocked_pos
 
-            if agent.has_path and not all(agent.mental_map.is_walkable(p) for p in agent.path):
-                active_goal = agent.active_goal
-                target_pos = (
-                    active_goal.target_position
-                    if active_goal and active_goal.target_position
-                    else None
-                )
-                if target_pos:
-                    new_path = self._pathfinder.find_path(agent.position, target_pos, agent.mental_map)
-                    if new_path:
-                        agent.assign_path(new_path)
-
-            if agent.has_path:
-                next_pos = agent.path[0]
-                blocking_entity = next(
-                    (other for other in visible_entities if other.position == next_pos),
-                    None,
-                )
-
-                all_context_entities = list(self._entities)
-                if not blocking_entity and not self._grid.is_walkable(next_pos):
-                    tile_type = self._grid.get_tile_type(next_pos)
-                    tile_name = (
-                        "Mauer"
-                        if tile_type == "wall"
-                        else ("Weltgrenze" if tile_type == "boundary" else tile_type.capitalize())
-                    )
-                    blocking_entity = WorldEntity(
-                        id=f"{tile_type}_{next_pos.x}_{next_pos.y}",
-                        name=tile_name,
-                        position=next_pos,
-                        entity_type=tile_type,
-                        is_conversational=False,
-                        is_passable=False,
-                    )
-                    all_context_entities.append(blocking_entity)
-
-                if blocking_entity:
-                    agent.is_thinking = True
-                    task = asyncio.create_task(
-                        self._conflict_coordinator.resolve_blockage(
-                            agent, blocking_entity, next_pos, all_context_entities
-                        )
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                else:
-                    prev_pos = agent.position
-                    agent.step()
-
-                    current_tile_type = self._grid.get_tile_type(agent.position)
-                    if agent.memory.get_type_assumed_walkable(current_tile_type) is None:
-                        agent.memory.record_type_walkability(current_tile_type, is_walkable=True, pos=agent.position)
-                        self._logger.log(
-                            SimulationEvent(
-                                tick=self._current_tick,
-                                agent_id=agent.id,
-                                event_type="tile_type_learned",
-                                summary=f"Agent {agent.name} erfährt durch Bewegung: Kacheltyp '{current_tile_type}' ist passierbar.",
-                                payload={"tile_type": current_tile_type, "is_walkable": True},
-                            )
-                        )
-
+                if is_within_range and is_still_heading_to_pos and is_agent_still_at_pos:
                     self._logger.log(
                         SimulationEvent(
                             tick=self._current_tick,
                             agent_id=agent.id,
-                            event_type="agent_moved",
-                            summary=f"Agent {agent.name} hat sich von ({prev_pos.x}, {prev_pos.y}) nach ({agent.position.x}, {agent.position.y}) bewegt.",
+                            event_type="interaction_dequeued",
+                            summary=f"Agent {agent.name} bearbeitet Anfrage von {requester.name}.",
+                            payload={"requester_id": requester.id, "distance": dist, "blocked_pos": [req.blocked_pos.x, req.blocked_pos.y]},
+                        )
+                    )
+                    break
+                else:
+                    self._logger.log(
+                        SimulationEvent(
+                            tick=self._current_tick,
+                            agent_id=agent.id,
+                            event_type="interaction_request_dropped",
+                            summary=f"Anfrage von {requester.name} an {agent.name} verworfen (Bedingung nicht mehr erfüllt).",
                             payload={
-                                "from": {"x": prev_pos.x, "y": prev_pos.y},
-                                "to": {"x": agent.position.x, "y": agent.position.y},
-                                "remaining_steps": len(agent.path),
-                                "energy": agent.energy,
+                                "requester_id": requester.id,
+                                "is_within_range": is_within_range,
+                                "is_still_heading_to_pos": is_still_heading_to_pos,
+                                "is_agent_still_at_pos": is_agent_still_at_pos,
                             },
                         )
                     )
 
-                    if not agent.has_path and len(agent.goals) > 1:
+            # Epistemische Zielsuche für Ziele mit target_entity_id
+            if (
+                not agent.is_busy
+                and agent.active_goal
+                and agent.active_goal.target_entity_id
+                and not agent.has_path
+            ):
+                search_res = self._target_search_service.search_target(
+                    agent=agent,
+                    target_entity_id=agent.active_goal.target_entity_id,
+                    grid=self._grid,
+                    entities=self._entities,
+                    current_tick=self._current_tick,
+                )
+                if search_res.path:
+                    agent.assign_path(search_res.path)
+
+            # Nischen-Ankunft prüfen (falls Agent bereits auf Nischenkachel steht)
+            current_goal = agent.active_goal
+            if (
+                current_goal is not None
+                and current_goal.target_position is not None
+                and agent.position == current_goal.target_position
+                and not current_goal.is_evasion_hold
+                and current_goal.junction_position is not None
+            ):
+                self._handle_niche_arrival(agent, current_goal)
+
+            # 2. Blockierung der Fortbewegung
+            if agent.is_thinking or agent.is_busy:
+                continue
+
+            # 3. Physischer Bewegungsschritt
+            if agent.has_path:
+                next_pos = agent.path[0]
+                is_walkable = self._grid.is_walkable(next_pos) and not any(
+                    e.position == next_pos for e in self._entities if e.id != agent.id
+                )
+
+                if is_walkable:
+                    agent.step()
+                    self._update_agent_perception(agent)
+                    current_goal = agent.active_goal
+
+                    if (
+                        current_goal is not None
+                        and current_goal.junction_position is not None
+                        and not current_goal.is_evasion_hold
+                        and not current_goal.halt_signaled
+                        and agent.position == current_goal.junction_position
+                    ):
+                        current_goal.halt_signaled = True
+                        partner_id = current_goal.yield_for_agent_id
+                        partner = next((e for e in self._entities if e.id == partner_id), None)
+                        if partner:
+                            partner.receive_message(
+                                IncomingMessage(
+                                    from_agent_id=agent.id,
+                                    from_agent_name=agent.name,
+                                    message="HALT WARTE!",
+                                    is_halt_request=True,
+                                    correlation_key=f"niche-entry-{agent.id}",
+                                )
+                            )
+
+                    if (
+                        current_goal is not None
+                        and current_goal.target_position is not None
+                        and agent.position == current_goal.target_position
+                        and not current_goal.is_evasion_hold
+                        and current_goal.junction_position is not None
+                    ):
+                        self._handle_niche_arrival(agent, current_goal)
+
+                    self._check_and_signal_clearance(agent)
+                else:
+                    blocking_entity = next(
+                        (e for e in self._entities if e.position == next_pos), None
+                    )
+                    if blocking_entity:
+                        if (
+                            isinstance(blocking_entity, Agent)
+                            and (
+                                blocking_entity.is_evasion_locked
+                                or (blocking_entity.active_goal and blocking_entity.active_goal.yield_for_agent_id == agent.id)
+                            )
+                        ):
+                            continue
+
                         agent.is_thinking = True
                         task = asyncio.create_task(
-                            self._goal_service.evaluate_sub_goal_completion(
-                                agent, self._grid, self._dialogue_history.get_recent_formatted(limit=8)
+                            self._conflict_coordinator.resolve_blockage(
+                                agent, blocking_entity, next_pos, self._entities
                             )
                         )
                         self._background_tasks.add(task)
                         task.add_done_callback(self._background_tasks.discard)
+            else:
+                self._check_and_signal_clearance(agent)
+
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+
+    def _replan_agent_path_avoiding(self, agent: Agent, forbidden_tiles: set[Position]) -> None:
+        """Berechnet den Pfad zum aktiven Ziel neu unter Meidung der Sperrkacheln."""
+        if not agent.active_goal or not agent.active_goal.target_position:
+            return
+
+        target = agent.active_goal.target_position
+        temp_obstacles: set[Position] = set()
+
+        for pos in forbidden_tiles:
+            if pos != target and pos != agent.position:
+                if agent.mental_map.is_walkable(pos):
+                    temp_obstacles.add(pos)
+                    agent.mental_map.update_tile(pos, is_walkable=False, tick=self._current_tick)
+
+        new_path = self._pathfinder.find_path(agent.position, target, agent.mental_map)
+
+        for pos in temp_obstacles:
+            agent.mental_map.update_tile(pos, is_walkable=True, tick=self._current_tick)
+
+        if new_path:
+            agent.assign_path(new_path)
 
     async def run(self, max_ticks: int = 20) -> None:
         self._is_running = True
@@ -328,7 +678,7 @@ class SimulationEngine:
 
         while self._is_running and self._current_tick < max_ticks:
             await asyncio.sleep(self._tick_interval)
-            self.process_tick()
+            await self.process_tick()
             known_tiles = self._collect_known_positions()
             self._presenter.render(
                 self._grid,

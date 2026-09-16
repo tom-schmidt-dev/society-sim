@@ -71,6 +71,17 @@ class GoalService:
             )
         return completed
 
+    def pop_goal_by_key(self, agent: Agent, correlation_key: str) -> Optional[Goal]:
+        """Entfernt das Ziel mit dem passenden correlation_key aus der Zielliste des Agenten."""
+        for i in range(len(agent.goals) - 1, -1, -1):
+            if agent.goals[i].correlation_key == correlation_key:
+                was_top = (i == len(agent.goals) - 1)
+                removed_goal = agent.goals.pop(i)
+                if was_top and agent.goals:
+                    agent.goals[-1].status = "active"
+                return removed_goal
+        return None
+
     def process_timed_goal(self, agent: Agent) -> bool:
         """Dekrementiert befristete Halteziele. Gibt True zurück, wenn der Agent in diesem Tick pausiert."""
         if agent.active_goal and agent.active_goal.remaining_ticks is not None:
@@ -92,6 +103,12 @@ class GoalService:
         if not target_sub_goal:
             agent.is_thinking = False
             return
+
+        # Physische Nischenhalteziele dürfen niemals kognitiv evaluiert oder gepoppt werden
+        if target_sub_goal.is_evasion_hold or agent.is_evasion_locked:
+            agent.is_thinking = False
+            return
+
         context = {
             "agent_id": agent.id,
             "name": agent.name,
@@ -103,7 +120,6 @@ class GoalService:
         }
         try:
             eval_res = await self._cognition_provider.evaluate_goal_status(context)
-            # Loggt den Tick NACH Abschluss des LLM-Aufrufs
             current_eval_tick = self._tick_provider()
             self._logger.log(
                 SimulationEvent(
@@ -123,7 +139,6 @@ class GoalService:
                 self.pop_goal(agent, target_goal=target_sub_goal, incident_id=eval_incident_id)
                 active_goal = agent.active_goal
                 if active_goal and active_goal.target_position:
-                    # P1: Pfadberechnung auf Basis der mentalen Karte des Agenten
                     new_path = self._pathfinder.find_path(
                         agent.position, active_goal.target_position, agent.mental_map
                     )
@@ -141,3 +156,64 @@ class GoalService:
             )
         finally:
             agent.is_thinking = False
+
+    def pause_goal(
+            self,
+            agent: Agent,
+            target_goal: Optional[Goal] = None,
+            incident_id: Optional[str] = None,
+    ) -> Optional[Goal]:
+        """Pausiert das spezifizierte (oder oberste aktive) Ziel für eine höherrangige Unterbrechung."""
+        goal = target_goal or agent.active_goal
+        if goal and goal.status == "active":
+            goal.status = "paused"
+            self._logger.log(
+                SimulationEvent(
+                    tick=self._tick_provider(),
+                    agent_id=agent.id,
+                    event_type="goal_paused",
+                    summary=f"Agent {agent.name}: Ziel '{goal.name}' pausiert.",
+                    payload={
+                        "incident_id": incident_id,
+                        "paused_goal": goal.to_dict(),
+                        "stack_depth": len(agent.goals),
+                    },
+                )
+            )
+            return goal
+        return None
+
+    def resume_goal(
+            self,
+            agent: Agent,
+            target_goal: Optional[Goal] = None,
+            incident_id: Optional[str] = None,
+    ) -> Optional[Goal]:
+        """Reaktiviert ein zuvor pausiertes Ziel."""
+        goal_to_resume: Optional[Goal] = None
+        if target_goal is not None:
+            if target_goal.status == "paused":
+                goal_to_resume = target_goal
+        else:
+            for g in reversed(agent.goals):
+                if g.status == "paused":
+                    goal_to_resume = g
+                    break
+
+        if goal_to_resume:
+            goal_to_resume.status = "active"
+            self._logger.log(
+                SimulationEvent(
+                    tick=self._tick_provider(),
+                    agent_id=agent.id,
+                    event_type="goal_resumed",
+                    summary=f"Agent {agent.name}: Ziel '{goal_to_resume.name}' reaktiviert.",
+                    payload={
+                        "incident_id": incident_id,
+                        "resumed_goal": goal_to_resume.to_dict(),
+                        "stack_depth": len(agent.goals),
+                    },
+                )
+            )
+            return goal_to_resume
+        return None

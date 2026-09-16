@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Any
 from src.domain.models.dialogue import DialogueRecord
 
 
@@ -28,6 +28,7 @@ class DialogueHistory:
         recipient_id: Optional[str],
         recipient_name: Optional[str],
         message: str,
+        intent: Optional[str] = None,
         is_inspection: bool = False,
         is_empty_response: bool = False,
     ) -> DialogueRecord:
@@ -39,11 +40,17 @@ class DialogueHistory:
             recipient_id=recipient_id,
             recipient_name=recipient_name,
             message=message,
+            intent=intent,
             is_inspection=is_inspection,
             is_empty_response=is_empty_response,
         )
         self.add_record(record)
         return record
+
+    def get_recent_structured(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Liefert die letzten Interaktionen als strukturierte Daten mit expliziter Attribution."""
+        recent = self.get_recent_records(limit=limit)
+        return [record.to_dict() for record in recent]
 
     def get_recent_records(self, limit: int = 8) -> list[DialogueRecord]:
         """Liefert die letzten n Datensätze."""

@@ -88,12 +88,15 @@ class InstructorCognitionAdapter(ICognitionProvider):
         # 1. Epistemisch vollständig erschöpft: Weder Sprache noch Tastung offen
         if not allow_talk and not allow_probe:
             system_prompt = (
-                "Du steuerst einen Agenten bei einer unüberwindbaren Blockade.\n\n"
-                "Das Hindernis ist bereits vollständig erprobt: Es reagiert nicht auf Sprache und ist unpassierbar.\n"
-                "Aktionen wie 'talk', 'inspect' und 'probe' sind unzulässig.\n\n"
+                "Du steuerst einen Agenten bei einer Blockade durch einen anderen Agenten.\n\n"
+                "Der Weg ist durch eine ansprechbare Person versperrt. Physische Aktionen sind unzulässig.\n\n"
                 "Handlungsanweisungen:\n"
-                "- Wähle 'reroute' (falls can_reroute True), um einen Alternativweg zu berechnen.\n"
-                "- Wähle 'wait', falls du warten möchtest.\n"
+                "- Wähle 'talk', um die Blockade verbal zu klären.\n"
+                "- Setze 'target_agent_id' zwingend auf die ID des Partners.\n"
+                "- Setze 'intent' passend zu deinem Anliegen:\n"
+                "  * 'request_yield': Du bittest das Gegenüber, den Weg freizumachen.\n"
+                "  * 'offer_yield': Du bietest an, selbst in eine Nische auszuweichen.\n"
+                "- Formuliere eine präzise, situative Nachricht im Feld 'message'.\n"
                 "- Formuliere deine Begründung im Feld 'thought'."
             )
             messages = [
@@ -237,23 +240,44 @@ class InstructorCognitionAdapter(ICognitionProvider):
 
     async def respond_to_dialogue(self, context: dict[str, Any]) -> DialogueResolution:
         turn_count = context.get("dialogue_turn_count", 1)
-        max_turns = context.get("max_dialogue_turns", 2)
+        recommended_role = context.get("recommended_role", "yield")
+        dist_self = context.get("evasion_distance_self")
+        dist_partner = context.get("evasion_distance_partner")
+        incoming_intent = context.get("incoming_intent")
+        peer_bid_farewell = context.get("peer_bid_farewell", False)
 
-        system_prompt = (
-            "Du steuerst einen Agenten im Dialog in einer 2D-Grid-Simulation.\n\n"
-            f"Aktuelle Runde: {turn_count} von maximal {max_turns}.\n\n"
-            "Verhaltensregeln:\n"
-            "- Prüfe 'partner_is_conversational', 'is_empty_response' und die bisherige Rundenanzahl.\n"
-            "- Wenn das Gegenüber nicht sprechen kann, keine Antwort gibt oder die maximale Rundenanzahl erreicht ist:\n"
-            "  -> Wähle zwingend 'action': {'action_type': 'end_dialogue', 'reason': '...'}.\n"
-            "  -> Formuliere in 'final_message' eine explizite Verabschiedung mit Begründung.\n"
-            "  -> Setze 'new_goal': {'name': 'In Nische ausweichen', 'intent_type': 'evade'}.\n"
-            "- Wähle 'talk' nur, wenn der Partner spricht und Klärungsbedarf besteht.\n"
-            "- 'target_agent_id' muss der 'partner_id' entsprechen."
-        )
+        prompt_lines = [
+            "Du steuerst die Verhandlung eines Agenten bei einer Blockade in einer 2D-Simulation.\n",
+            f"Aktuelle Verhandlungsrunde: {turn_count}.",
+            f"Eigener Weg zur nächsten Nische: {dist_self} Schritte.",
+            f"Weg des Partners zur nächsten Nische: {dist_partner} Schritte.",
+            f"Empfohlene Rolle laut Geometrie: '{recommended_role}'.",
+            f"Letzter eingehender Intent des Partners: '{incoming_intent}'.",
+        ]
+
+        if peer_bid_farewell:
+            prompt_lines.extend([
+                "\nSTATUS: Dein Partner hat sich verabschiedet (peer_bid_farewell=True).",
+                "- Reguläre Aktion: Bestätige die Verabschiedung mit 'end_dialogue' (final_message formulieren).",
+                "- Ausnahme: Nur wenn du zwingend noch Hilfe benötigst oder die Situation für dich ungelöst ist, "
+                "wähle 'talk' mit negotiation_intent='reject'. Du musst im Feld 'reason' und in 'message' "
+                "zwingend begründen, was genau noch ungeklärt ist.",
+            ])
+        else:
+            prompt_lines.extend([
+                "\nEntscheidungsregeln für 'negotiation_intent':",
+                "- 'offer_yield': Du bietest an, in die Nische auszuweichen.",
+                "- 'request_yield': Du forderst den Partner auf, auszuweichen.",
+                "- 'accept': Du stimmst dem Vorschlag des Partners zu.",
+                "- 'reject': Du lehnst den Vorschlag ab und machst einen Gegenvorschlag.",
+                "\nKommunikationsregeln:",
+                "- Setze 'negotiation_intent' passend zu deiner Absicht.",
+                "- Wenn eine Einigung erzielt wurde: Wähle 'end_dialogue' mit finaler Bestätigung.",
+                "- Halte die Unterhaltung kurz und zielführend.",
+            ])
 
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": "\n".join(prompt_lines)},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ]
 
