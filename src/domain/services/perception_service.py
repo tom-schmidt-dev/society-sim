@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from typing import Optional
 from src.domain.models.agent import Agent
+from src.domain.models.message import CommunicationChannel
 from src.domain.models.position import Position
 from src.domain.models.world import WorldGrid
 from src.domain.models.world_entity import WorldEntity
 
 
 class PerceptionService:
+    # Feste Reichweitengrenzen nach L1-Manhattan-Distanz
+    CHANNEL_RANGES: dict[CommunicationChannel, Optional[int]] = {
+        CommunicationChannel.LOCAL_TALK: 3,
+        CommunicationChannel.PUBLIC_ADDRESS: 15,
+        CommunicationChannel.DIGITAL_NETWORK: None,  # Unbegrenzte Reichweite
+    }
+
     def __init__(self, default_radius: int = 3) -> None:
         self._default_radius: int = default_radius
 
@@ -35,7 +44,7 @@ class PerceptionService:
         entities: list[WorldEntity],
         radius: int | None = None,
     ) -> list[WorldEntity]:
-        """Filtert alle Entitäten heraus, die sich innerhalb des Sichtfelds des Agenten befinden (ohne sich selbst)."""
+        """Filtert alle Entitäten heraus, die sich innerhalb des Sichtfelds des Agenten befinden."""
         effective_radius = radius if radius is not None else self._default_radius
         return [
             entity
@@ -43,3 +52,15 @@ class PerceptionService:
             if entity.id != agent.id
             and agent.position.manhattan_distance(entity.position) <= effective_radius
         ]
+
+    def is_in_channel_range(
+        self,
+        sender_pos: Position,
+        recipient_pos: Position,
+        channel: CommunicationChannel,
+    ) -> bool:
+        """Prüft, ob eine Nachricht die Distanzbeschränkung des Übertragungskanals einhält."""
+        max_dist = self.CHANNEL_RANGES.get(channel)
+        if max_dist is None:
+            return True
+        return sender_pos.manhattan_distance(recipient_pos) <= max_dist

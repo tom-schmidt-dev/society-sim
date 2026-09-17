@@ -19,12 +19,13 @@ class EvasionFinder:
     def __init__(self, pathfinder: IPathfinder) -> None:
         self._pathfinder: IPathfinder = pathfinder
 
-    def _is_known_walkable(self, grid: Any, pos: Position) -> bool:
+    @staticmethod
+    def _is_known_walkable(grid: Any, pos: Position) -> bool:
         """Prüft, ob eine Kachel verifiziert passierbar ist (schließt UNKNOWN aus)."""
         if isinstance(grid, AgentMentalMap):
             tile = grid.tiles.get(pos)
             return tile is not None and tile.knowledge == TileKnowledge.WALKABLE
-        return grid.is_walkable(pos)
+        return bool(grid.is_walkable(pos))
 
     def find_nearest_evasion_tile(
         self,
@@ -98,9 +99,10 @@ class EvasionFinder:
         grid: AgentMentalMap,
         frontier_forbidden: set[Position],
         direction_vector: Optional[tuple[float, float]] = None,
+        max_depth: int = 15,
     ) -> tuple[Optional[Position], dict[Position, Position]]:
-        """Findet die nächstgelegene Grenzkachel, optional gerichtet entlang eines Sektors."""
-        frontier_queue: list[Position] = [start]
+        """Findet die nächstgelegene Grenzkachel mit Tiefenbegrenzung und Sektor-Gewichtung."""
+        frontier_queue: list[tuple[Position, int]] = [(start, 0)]
         frontier_visited: set[Position] = {start} | frontier_forbidden
         came_from: dict[Position, Position] = {}
 
@@ -108,7 +110,6 @@ class EvasionFinder:
             if not direction_vector or direction_vector == (0.0, 0.0):
                 return neighbors
             vx, vy = direction_vector
-            # Sortiert absteigend nach Skalarprodukt (bevorzugt Kacheln im Bewegungswinkel)
             return sorted(
                 neighbors,
                 key=lambda nb: (nb.x - current.x) * vx + (nb.y - current.y) * vy,
@@ -116,7 +117,7 @@ class EvasionFinder:
             )
 
         while frontier_queue:
-            curr = frontier_queue.pop(0)
+            curr, depth = frontier_queue.pop(0)
 
             if curr != start:
                 for neighbor in curr.get_neighbors():
@@ -125,21 +126,25 @@ class EvasionFinder:
                         if tile is None or tile.knowledge == TileKnowledge.UNKNOWN:
                             return curr, came_from
 
+            # Abbruch bei Erreichen der maximalen Suchtiefe
+            if depth >= max_depth:
+                continue
+
             neighbors = _sort_neighbors(curr.get_neighbors(), curr)
             for neighbor in neighbors:
                 if neighbor not in frontier_visited and grid.is_within_bounds(neighbor):
                     frontier_visited.add(neighbor)
                     if self._is_known_walkable(grid, neighbor):
                         came_from[neighbor] = curr
-                        frontier_queue.append(neighbor)
+                        frontier_queue.append((neighbor, depth + 1))
 
         return None, came_from
 
+    @staticmethod
     def _reconstruct_path(
-            self,
-            start: Position,
-            target: Position,
-            came_from: dict[Position, Position],
+        start: Position,
+        target: Position,
+        came_from: dict[Position, Position],
     ) -> list[Position]:
         curr = target
         path: list[Position] = []
@@ -149,8 +154,8 @@ class EvasionFinder:
         path.reverse()
         return path
 
+    @staticmethod
     def _determine_junction(
-        self,
         evasion_path: list[Position],
         partner_trajectory: set[Position],
         default_pos: Position,

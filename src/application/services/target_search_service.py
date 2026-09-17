@@ -41,16 +41,33 @@ class TargetSearchService:
         entities: list[WorldEntity],
         current_tick: int,
     ) -> TargetSearchResult:
-        """
-        Führt die dreistufige epistemische Suchkaskade aus:
-        1. Direkte Wahrnehmung (PerceptionService)
-        2. Extrapolation aus mentaler Karte & Geschwindigkeitsvektoren (AgentMemory)
-        3. Sektorbasierte Frontier-Exploration im Bewegungsvektor
-        """
+        """Führt die dreistufige epistemische Suchkaskade mit Zielabweichungsprüfung aus."""
         # Stufe 1: Direkte Wahrnehmung
         visible_entities = self._perception_service.get_visible_entities(agent, entities)
         target_entity = next((e for e in visible_entities if e.id == target_entity_id), None)
+
         if target_entity:
+            # Abweichungsprüfung gegen bisherigen Pfad
+            if agent.has_path:
+                current_target_endpoint = agent.path[-1]
+                deviation = current_target_endpoint.manhattan_distance(target_entity.position)
+                if deviation > 2:
+                    self._logger.log(
+                        SimulationEvent(
+                            tick=current_tick,
+                            agent_id=agent.id,
+                            event_type="target_trajectory_invalidated",
+                            summary=f"Agent {agent.name}: Ziel {target_entity.name} weicht um {deviation} Kacheln vom Pfadziel ab. Pfad wird verworfen.",
+                            payload={
+                                "target_id": target_entity_id,
+                                "old_endpoint": [current_target_endpoint.x, current_target_endpoint.y],
+                                "actual_pos": [target_entity.position.x, target_entity.position.y],
+                                "deviation": deviation,
+                            },
+                        )
+                    )
+                    agent.clear_path()
+
             path = self._pathfinder.find_path(agent.position, target_entity.position, agent.mental_map)
             self._logger.log(
                 SimulationEvent(

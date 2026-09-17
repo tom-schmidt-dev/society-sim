@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Any, Optional
 from src.domain.models.dialogue import DialogueRecord
 
 
@@ -11,11 +11,9 @@ class DialogueHistory:
 
     @property
     def records(self) -> list[DialogueRecord]:
-        """Gibt die Liste aller unveränderten Ereignisdatensätze zurück."""
         return list(self._records)
 
     def add_record(self, record: DialogueRecord) -> None:
-        """Fügt einen neuen Datensatz hinzu und begrenzt optional die Kapazität."""
         self._records.append(record)
         if self._max_capacity and len(self._records) > self._max_capacity:
             self._records.pop(0)
@@ -32,7 +30,6 @@ class DialogueHistory:
         is_inspection: bool = False,
         is_empty_response: bool = False,
     ) -> DialogueRecord:
-        """Erstellt und speichert einen DialogueRecord in einem Aufruf."""
         record = DialogueRecord(
             tick=tick,
             sender_id=sender_id,
@@ -48,19 +45,30 @@ class DialogueHistory:
         return record
 
     def get_recent_structured(self, limit: int = 8) -> list[dict[str, Any]]:
-        """Liefert die letzten Interaktionen als strukturierte Daten mit expliziter Attribution."""
         recent = self.get_recent_records(limit=limit)
         return [record.to_dict() for record in recent]
 
     def get_recent_records(self, limit: int = 8) -> list[DialogueRecord]:
-        """Liefert die letzten n Datensätze."""
         return self._records[-limit:] if limit > 0 else []
 
     def get_recent_formatted(self, limit: int = 8) -> list[str]:
-        """Liefert die letzten n Interaktionen als formatierte Textzeilen für UI und Prompts."""
         recent = self.get_recent_records(limit=limit)
-        return [record.format_for_display() for record in recent]
+        formatted: list[str] = []
+        for record in recent:
+            line = record.format_for_display()
+            # Abgewiesene Verabschiedungen für LLM-Kontext explizit kennzeichnen
+            if record.intent == "reject":
+                line = f"[ABGELEHNT] {line}"
+            formatted.append(line)
+        return formatted
+
+    def get_unresolved_rejections(self, agent_a_id: str, agent_b_id: str) -> list[DialogueRecord]:
+        """Ermittelt abgewiesene Verhandlungen zwischen zwei Entitäten zur Kontextinjektion."""
+        pair = {agent_a_id, agent_b_id}
+        return [
+            r for r in self._records
+            if {r.sender_id, r.recipient_id} == pair and r.intent == "reject"
+        ]
 
     def clear(self) -> None:
-        """Leert den gesamten Historienpuffer."""
         self._records.clear()

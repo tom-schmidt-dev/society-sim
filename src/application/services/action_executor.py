@@ -17,12 +17,13 @@ from src.domain.models.cognition import (
 )
 from src.domain.models.events import SimulationEvent
 from src.domain.models.goal import ExecutionPriority, Goal
-from src.domain.models.message import IncomingMessage
+from src.domain.models.message import CommunicationChannel, IncomingMessage
 from src.domain.models.position import Position
 from src.domain.models.world import WorldGrid
 from src.domain.models.world_entity import WorldEntity
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
+from src.domain.services.perception_service import PerceptionService
 
 
 class ActionExecutor:
@@ -33,6 +34,7 @@ class ActionExecutor:
         dialogue_history: DialogueHistory,
         goal_service: GoalService,
         pathfinder: IPathfinder,
+        perception_service: Optional[PerceptionService] = None,
         evasion_finder: Optional[EvasionFinder] = None,
         critical_section_coordinator: Optional[CriticalSectionCoordinator] = None,
         tick_provider: Optional[Callable[[], int]] = None,
@@ -42,6 +44,7 @@ class ActionExecutor:
         self._dialogue_history = dialogue_history
         self._goal_service = goal_service
         self._pathfinder = pathfinder
+        self._perception_service = perception_service or PerceptionService(default_radius=3)
         self._evasion_finder = evasion_finder or EvasionFinder(pathfinder)
         self._tick_provider = tick_provider or (lambda: 0)
         self._critical_section_coordinator = (
@@ -53,10 +56,10 @@ class ActionExecutor:
     def critical_section_coordinator(self) -> CriticalSectionCoordinator:
         return self._critical_section_coordinator
 
+    @staticmethod
     def find_entity(
-        self, target_id: str, all_entities: list[WorldEntity]
+        target_id: str, all_entities: list[WorldEntity]
     ) -> Optional[WorldEntity]:
-        """Ermittelt eine Entität über ID oder Namensabgleich."""
         target_lower = target_id.lower()
         for entity in all_entities:
             if (
@@ -67,10 +70,11 @@ class ActionExecutor:
                 return entity
         return None
 
+    @staticmethod
     def create_talk_message(
-        self,
         agent: Agent,
         message_text: str,
+        channel: CommunicationChannel = CommunicationChannel.LOCAL_TALK,
         share_path: bool = True,
         is_path_update: bool = False,
         correlation_key: Optional[str] = None,
@@ -78,15 +82,16 @@ class ActionExecutor:
         intent: Optional[str] = None,
         is_farewell: bool = False,
     ) -> IncomingMessage:
-        """Erzeugt eine Nachricht mit modularer Injektion des geplanten Pfades und Verhandlungs-Intents."""
         path_payload = None
-        if share_path and agent.active_goal and agent.has_path:
+        active_goal = agent.active_goal
+        if share_path and active_goal and agent.has_path:
             path_payload = [agent.position] + list(agent.path)
 
         return IncomingMessage(
             from_agent_id=agent.id,
             from_agent_name=agent.name,
             message=message_text,
+            channel=channel,
             planned_path=path_payload,
             is_path_update=is_path_update,
             correlation_key=correlation_key,
@@ -95,7 +100,18 @@ class ActionExecutor:
             is_farewell=is_farewell,
         )
 
-    _create_talk_message = create_talk_message
+    @staticmethod
+    def validate_pre_commit(
+        agent: Agent,
+        blocker: WorldEntity,
+        blocked_pos: Position,
+    ) -> bool:
+        """TOCTOU-Schutz: Prüft unmittelbar vor Ausführung, ob die Blockade noch besteht."""
+        if not agent.has_path or agent.path[0] != blocked_pos:
+            return False
+        if blocker.position != blocked_pos:
+            return False
+        return True
 
     def _handle_non_conversational_talk(
         self,
@@ -105,18 +121,19 @@ class ActionExecutor:
         incident_id: str,
         current_tick: int,
     ) -> None:
-        """Behandelt die Interaktion mit passiven Entitäten einheitlich an zentraler Stelle."""
         target.receive_message(
             IncomingMessage(
                 from_agent_id=agent.id,
                 from_agent_name=agent.name,
                 message=message,
+                channel=CommunicationChannel.LOCAL_TALK,
             )
         )
         empty_resp = IncomingMessage(
             from_agent_id=target.id,
             from_agent_name=target.name,
             message="",
+            channel=CommunicationChannel.LOCAL_TALK,
             is_empty_response=True,
         )
         agent.receive_message(empty_resp)
@@ -135,6 +152,39 @@ class ActionExecutor:
             is_empty_response=True,
         )
 
+    def dispatch_message(
+            self,
+            sender: Agent,
+            recipient: WorldEntity,
+            message: IncomingMessage,
+            incident_id: str,
+    ) -> bool:
+        """Prüft die Kanalreichweite und stellt die Nachricht bei Erfolg in den Staging-Puffer."""
+        current_tick = self._tick_provider()
+        in_range = self._perception_service.is_in_channel_range(
+            sender.position, recipient.position, message.channel
+        )
+        if not in_range:
+            dist = sender.position.manhattan_distance(recipient.position)
+            self._logger.log(
+                SimulationEvent(
+                    tick=current_tick,
+                    agent_id=sender.id,
+                    event_type="message_out_of_range",
+                    summary=f"Nachricht von {sender.name} an {recipient.name} verworfen: Außerhalb Kanalreichweite ({message.channel.value}, Distanz: {dist}).",
+                    payload={
+                        "incident_id": incident_id,
+                        "recipient_id": recipient.id,
+                        "channel": message.channel.value,
+                        "distance": dist,
+                    },
+                )
+            )
+            return False
+
+        recipient.receive_message(message)
+        return True
+
     def execute_evasion(
         self,
         agent: Agent,
@@ -144,8 +194,21 @@ class ActionExecutor:
         incident_id: str,
         thought: str,
         sub_goal_name: Optional[str] = None,
-    ) -> None:
-        """Führt die Ausweichkaskade deterministisch aus."""
+    ) -> bool:
+        """Führt die Ausweichkaskade mit atomarer Pre-Commit-Pfadvalidierung aus."""
+        # 1. Pre-Commit Check: Ist die Blockadesituation überhaupt noch existent?
+        if partner and partner.position != blocked_pos:
+            self._logger.log(
+                SimulationEvent(
+                    tick=self._tick_provider(),
+                    agent_id=agent.id,
+                    event_type="evasion_precommit_invalidated",
+                    summary=f"Agent {agent.name}: Ausweichen verworfen, da Partner {partner.name} Feld ({blocked_pos.x}, {blocked_pos.y}) geräumt hat.",
+                    payload={"incident_id": incident_id, "partner_id": partner.id},
+                )
+            )
+            return False
+
         occupied = {other.position for other in all_entities if other.id != agent.id}
         partner_id = partner.id if partner else None
         partner_fact = agent.memory.known_entities.get(partner_id) if partner_id else None
@@ -167,11 +230,27 @@ class ActionExecutor:
             search_direction=search_dir,
         )
 
+        # 2. Pre-Commit Check: Ist der berechnete Ausweichpfad weiterhin kollisionsfrei?
+        if evasion_res and evasion_res.path:
+            is_path_blocked = any(step in occupied for step in evasion_res.path)
+            if is_path_blocked:
+                self._logger.log(
+                    SimulationEvent(
+                        tick=self._tick_provider(),
+                        agent_id=agent.id,
+                        event_type="evasion_precommit_invalidated",
+                        summary=f"Agent {agent.name}: Ausweichpfad nach ({evasion_res.target_tile.x}, {evasion_res.target_tile.y}) ist belegt.",
+                        payload={"incident_id": incident_id},
+                    )
+                )
+                return False
+
         agent.is_waiting_for_reply = False
         agent.is_listening_to_peer = False
 
-        if agent.active_goal and agent.active_goal.priority > ExecutionPriority.URGENT:
-            self._goal_service.pause_goal(agent, agent.active_goal, incident_id=incident_id)
+        active_goal = agent.active_goal
+        if active_goal and active_goal.priority > ExecutionPriority.URGENT:
+            self._goal_service.pause_goal(agent, active_goal, incident_id=incident_id)
 
         if evasion_res and not evasion_res.is_frontier:
             goal_name = sub_goal_name or "In Nische ausweichen"
@@ -195,24 +274,12 @@ class ActionExecutor:
                 msg = self.create_talk_message(
                     agent=agent,
                     message_text=f"Ich mache Platz und weiche nach ({evasion_res.target_tile.x}, {evasion_res.target_tile.y}) aus.",
+                    channel=CommunicationChannel.LOCAL_TALK,
                     share_path=True,
                     is_evasion_notice=True,
                 )
                 partner.receive_message(msg)
-                self._logger.log(
-                    SimulationEvent(
-                        tick=self._tick_provider(),
-                        agent_id=agent.id,
-                        event_type="message_delivered",
-                        summary=f"Agent {agent.name} kündigt Ausweichen an {partner.name} an.",
-                        payload={
-                            "incident_id": incident_id,
-                            "sender_id": agent.id,
-                            "recipient_id": partner.id,
-                            "message": msg.message,
-                        },
-                    )
-                )
+            return True
 
         elif evasion_res and evasion_res.is_frontier:
             self._goal_service.push_goal(
@@ -234,9 +301,11 @@ class ActionExecutor:
                 msg = self.create_talk_message(
                     agent=agent,
                     message_text="Ich suche nach einer Nische und erkunde den Bereich.",
+                    channel=CommunicationChannel.LOCAL_TALK,
                     share_path=True,
                 )
                 partner.receive_message(msg)
+            return True
 
         else:
             if partner:
@@ -244,8 +313,10 @@ class ActionExecutor:
                     from_agent_id=agent.id,
                     from_agent_name=agent.name,
                     message="Ich kann nicht ausweichen, kein freies Feld gefunden.",
+                    channel=CommunicationChannel.LOCAL_TALK,
                 )
                 partner.receive_message(msg)
+            return False
 
     def execute_inspection(
         self,
@@ -254,9 +325,9 @@ class ActionExecutor:
         incident_id: str,
         current_tick: int,
     ) -> None:
-        """Erfasst Typ und Beschaffenheit einer Entität im Nahbereich mit Critical-Section-Absicherung."""
         resource_key = f"entity:{blocker.id}"
-        prio = agent.active_goal.priority if agent.active_goal else ExecutionPriority.ROUTINE
+        active_goal = agent.active_goal
+        prio = active_goal.priority if active_goal else ExecutionPriority.ROUTINE
         has_lock = self._critical_section_coordinator.acquire_or_queue(agent, resource_key, prio)
 
         if not has_lock:
@@ -298,9 +369,9 @@ class ActionExecutor:
         incident_id: str,
         current_tick: int,
     ) -> None:
-        """Erprobt physisch die Passierbarkeit eines Hindernisses mit Critical-Section-Absicherung."""
         resource_key = f"entity:{blocker.id}"
-        prio = agent.active_goal.priority if agent.active_goal else ExecutionPriority.ROUTINE
+        active_goal = agent.active_goal
+        prio = active_goal.priority if active_goal else ExecutionPriority.ROUTINE
         has_lock = self._critical_section_coordinator.acquire_or_queue(agent, resource_key, prio)
 
         if not has_lock:
@@ -352,13 +423,25 @@ class ActionExecutor:
         action: Any,
         incident_id: str,
         all_entities: list[WorldEntity],
-        blocked_pos: Optional[Position] = None,
+        blocked_pos: Position,
         current_tick: Optional[int] = None,
         thought: str = "",
         duration_ms: float = 0.0,
     ) -> None:
-        """Führt die vom Agenten gewählte Blockade-Aktion atomar aus."""
         tick = current_tick if current_tick is not None else self._tick_provider()
+
+        # TOCTOU-Validierung vor Commit
+        if not self.validate_pre_commit(agent, blocker, blocked_pos):
+            self._logger.log(
+                SimulationEvent(
+                    tick=tick,
+                    agent_id=agent.id,
+                    event_type="action_precommit_invalidated",
+                    summary=f"Agent {agent.name}: Aktion verworfen, da Blockadesituation an ({blocked_pos.x}, {blocked_pos.y}) nicht mehr besteht.",
+                    payload={"incident_id": incident_id, "action": action.action_type},
+                )
+            )
+            return
 
         if isinstance(action, TalkAction):
             target = self.find_entity(action.target_agent_id, all_entities) or blocker
@@ -374,32 +457,19 @@ class ActionExecutor:
                 message=action.message,
                 intent=action.intent,
             )
-            self._logger.log(
-                SimulationEvent(
-                    tick=tick,
-                    agent_id=agent.id,
-                    event_type="message_delivered",
-                    summary=f"Agent {agent.name} sagt zu {target_name}: '{action.message}' (Intent: {action.intent})",
-                    payload={
-                        "incident_id": incident_id,
-                        "sender_id": agent.id,
-                        "recipient_id": target_id,
-                        "message": action.message,
-                        "intent": action.intent,
-                    },
-                )
-            )
 
             if not target.is_conversational:
                 self._handle_non_conversational_talk(
                     agent, target, action.message, incident_id, tick
                 )
             elif isinstance(target, Agent):
-                msg = self.create_talk_message(agent, action.message, intent=action.intent)
-                target.receive_message(msg)
-                agent.is_waiting_for_reply = True
-                agent.interaction_partner_id = target.id
-                target.interaction_partner_id = agent.id
+                msg = self.create_talk_message(agent, action.message, channel=CommunicationChannel.LOCAL_TALK,
+                                               intent=action.intent)
+                delivered = self.dispatch_message(agent, target, msg, incident_id)
+                if delivered:
+                    agent.is_waiting_for_reply = True
+                    agent.interaction_partner_id = target.id
+                    target.interaction_partner_id = agent.id
 
         elif isinstance(action, InspectAction):
             self.execute_inspection(agent, blocker, incident_id, tick)
@@ -422,24 +492,16 @@ class ActionExecutor:
 
         elif isinstance(action, RerouteAction):
             active_goal = agent.active_goal
-            target_pos = (
-                active_goal.target_position
-                if active_goal and active_goal.target_position
-                else (agent.path[-1] if agent.has_path else None)
-            )
+            target_pos = None
+            if active_goal and active_goal.target_position:
+                target_pos = active_goal.target_position
+            elif agent.has_path:
+                target_pos = agent.path[-1]
+
             if target_pos:
                 new_path = self._pathfinder.find_path(agent.position, target_pos, agent.mental_map)
                 if new_path:
                     agent.assign_path(new_path)
-            self._logger.log(
-                SimulationEvent(
-                    tick=tick,
-                    agent_id=agent.id,
-                    event_type="reroute_requested",
-                    summary=f"Agent {agent.name} plant Pfad um.",
-                    payload={"incident_id": incident_id, "reason": action.reason},
-                )
-            )
 
         elif isinstance(action, AbortAction):
             agent.clear_path()
@@ -457,7 +519,6 @@ class ActionExecutor:
                     "action": action.action_type,
                     "reason": action.reason,
                     "internal_thought": thought,
-                    "action_details": action.model_dump(),
                 },
             )
         )
@@ -470,7 +531,6 @@ class ActionExecutor:
         incident_id: str,
         all_entities: list[WorldEntity],
     ) -> None:
-        """Führt eine Konversationsentscheidung deterministisch aus."""
         current_tick = self._tick_provider()
 
         if isinstance(action, EndDialogueAction):
@@ -486,36 +546,21 @@ class ActionExecutor:
                 recipient_name=partner_name,
                 message=final_msg,
             )
-            self._logger.log(
-                SimulationEvent(
-                    tick=current_tick,
-                    agent_id=agent.id,
-                    event_type="message_delivered",
-                    summary=f"Agent {agent.name} verabschiedet sich von {partner_name}: '{final_msg}'",
-                    payload={
-                        "incident_id": incident_id,
-                        "sender_id": agent.id,
-                        "recipient_id": partner_id,
-                        "message": final_msg,
-                        "reason": action.reason,
-                    },
-                )
-            )
 
-            is_evading = agent.active_goal and agent.active_goal.priority == ExecutionPriority.URGENT
-
+            active_goal = agent.active_goal
+            is_evading = active_goal is not None and active_goal.priority == ExecutionPriority.URGENT
             agent.has_bid_farewell = True
             agent.is_waiting_for_reply = not is_evading
 
             if partner and partner.is_conversational:
-                partner.receive_message(
-                    IncomingMessage(
-                        from_agent_id=agent.id,
-                        from_agent_name=agent.name,
-                        message=final_msg,
-                        is_farewell=True,
-                    )
+                farewell_msg = IncomingMessage(
+                    from_agent_id=agent.id,
+                    from_agent_name=agent.name,
+                    message=final_msg,
+                    channel=CommunicationChannel.LOCAL_TALK,
+                    is_farewell=True,
                 )
+                self.dispatch_message(agent, partner, farewell_msg, incident_id)
                 if isinstance(partner, Agent):
                     partner.peer_bid_farewell = True
                     if partner.has_bid_farewell or is_evading or not partner.interaction_partner_id:
@@ -552,10 +597,9 @@ class ActionExecutor:
                         agent, target, action.message, incident_id, current_tick
                     )
                 else:
-                    msg = self.create_talk_message(agent, action.message, intent=action.intent)
-                    target.receive_message(msg)
-
-                    if action.intent not in ("accept", "offer_yield"):
+                    msg = self.create_talk_message(agent, action.message, channel=CommunicationChannel.LOCAL_TALK, intent=action.intent)
+                    delivered = self.dispatch_message(agent, target, msg, incident_id)
+                    if delivered and action.intent not in ("accept", "offer_yield"):
                         agent.is_waiting_for_reply = True
                         agent.interaction_partner_id = target.id
                         if isinstance(target, Agent):

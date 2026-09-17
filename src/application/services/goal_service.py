@@ -55,6 +55,7 @@ class GoalService:
         """Entfernt das spezifizierte (oder oberste) Ziel und erfasst das Ereignis mit dem aktuellen Tick."""
         completed = agent.pop_goal(target_goal=target_goal)
         if completed:
+            active_g = agent.active_goal
             self._logger.log(
                 SimulationEvent(
                     tick=self._tick_provider(),
@@ -64,14 +65,15 @@ class GoalService:
                     payload={
                         "incident_id": incident_id,
                         "completed_goal": completed.to_dict(),
-                        "active_goal": agent.active_goal.to_dict() if agent.active_goal else None,
+                        "active_goal": active_g.to_dict() if active_g else None,
                         "stack_depth": len(agent.goals),
                     },
                 )
             )
         return completed
 
-    def pop_goal_by_key(self, agent: Agent, correlation_key: str) -> Optional[Goal]:
+    @staticmethod
+    def pop_goal_by_key(agent: Agent, correlation_key: str) -> Optional[Goal]:
         """Entfernt das Ziel mit dem passenden correlation_key aus der Zielliste des Agenten."""
         for i in range(len(agent.goals) - 1, -1, -1):
             if agent.goals[i].correlation_key == correlation_key:
@@ -84,8 +86,9 @@ class GoalService:
 
     def process_timed_goal(self, agent: Agent) -> bool:
         """Dekrementiert befristete Halteziele. Gibt True zurück, wenn der Agent in diesem Tick pausiert."""
-        if agent.active_goal and agent.active_goal.remaining_ticks is not None:
-            if agent.active_goal.tick():
+        active_goal = agent.active_goal
+        if active_goal and active_goal.remaining_ticks is not None:
+            if active_goal.tick():
                 self.pop_goal(agent)
             return True
         return False
@@ -136,12 +139,13 @@ class GoalService:
             agent.is_thinking = False
             return
 
+        active_goal = agent.active_goal
         context = {
             "agent_id": agent.id,
             "name": agent.name,
             "current_x": agent.position.x,
             "current_y": agent.position.y,
-            "active_goal": agent.active_goal.to_dict() if agent.active_goal else None,
+            "active_goal": active_goal.to_dict() if active_goal else None,
             "goal_stack": [g.to_dict() for g in agent.goals],
             "recent_dialogues": recent_dialogues,
         }

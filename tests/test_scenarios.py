@@ -147,7 +147,8 @@ async def test_corridor_substep3_clearance_and_resumption() -> None:
 
     assert alice.active_goal.name == "Ost-Tor"
     assert alice.has_path is True
-    assert alice.path[0] == Position(12, 3)
+    assert alice.position == Position(12, 3)
+    assert alice.path[0] == Position(13, 3)
 
 
 @pytest.mark.asyncio

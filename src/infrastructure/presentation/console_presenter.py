@@ -9,8 +9,8 @@ from src.domain.ports.presenter import IPresenter
 
 
 class ConsolePresenter(IPresenter):
+    @staticmethod
     def render(
-        self,
         grid: WorldGrid,
         entities: list[WorldEntity],
         tick: int,

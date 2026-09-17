@@ -48,34 +48,41 @@ class ConflictCoordinator(IConflictCoordinator):
         self._dialogue_history = dialogue_history
         self._tick_provider = tick_provider or (lambda: 0)
 
+        # In src/application/services/conflict_coordinator.py
+        # Ersetzung der Methode: resolve_blockage
+
     async def resolve_blockage(
-        self,
-        agent: Agent,
-        blocker: WorldEntity,
-        blocked_pos: Position,
-        all_entities: list[WorldEntity],
+            self,
+            agent: Agent,
+            blocker: WorldEntity,
+            blocked_pos: Position,
+            all_entities: list[WorldEntity],
     ) -> None:
         lock = self._session_manager.get_lock(agent.id, blocker.id)
+
         current_tick = self._tick_provider()
         incident_id = f"inc-t{current_tick}-{agent.id}x{blocker.id}-{uuid.uuid4().hex[:6]}"
 
         try:
-            async with lock:
+            async with self._session_manager.acquire_session(agent.id, blocker.id, tick=current_tick) as lock_granted:
+                if not lock_granted:
+                    agent.is_thinking = False
+                    return
+
+                # 1. Schnelle Vorabprüfung
                 if not agent.has_path or agent.path[0] != blocked_pos or blocker.position != blocked_pos:
                     return
 
                 if agent.inbox and any(m.from_agent_id == blocker.id for m in agent.inbox):
                     return
-                if isinstance(blocker, Agent) and blocker.interaction_partner_id == agent.id:
-                    return
 
                 is_busy_with_third_party = (
-                    isinstance(blocker, Agent)
-                    and blocker.interaction_partner_id is not None
-                    and blocker.interaction_partner_id != agent.id
+                        isinstance(blocker, Agent)
+                        and blocker.interaction_partner_id is not None
+                        and blocker.interaction_partner_id != agent.id
                 )
 
-                if is_busy_with_third_party:
+                if is_busy_with_third_party and isinstance(blocker, Agent):
                     if not any(req.requester_id == agent.id for req in blocker.interaction_queue):
                         from src.domain.models.interaction_request import InteractionRequest
                         blocker.interaction_queue.append(
@@ -99,62 +106,25 @@ class ConflictCoordinator(IConflictCoordinator):
                         )
                     return
 
-                if (
-                    isinstance(blocker, Agent)
-                    and (
+                if isinstance(blocker, Agent):
+                    blocker_goal = blocker.active_goal
+                    if (
                         blocker.is_evasion_locked
-                        or (blocker.active_goal is not None and blocker.active_goal.yield_for_agent_id == agent.id)
-                    )
-                ):
-                    return
+                        or (blocker_goal is not None and blocker_goal.yield_for_agent_id == agent.id)
+                    ):
+                        return
 
                 if isinstance(blocker, Agent):
                     blocker.is_listening_to_peer = True
                     blocker.interaction_partner_id = agent.id
 
                 try:
-                    self._logger.log(
-                        SimulationEvent(
-                            tick=current_tick,
-                            agent_id=agent.id,
-                            event_type="movement_blocked",
-                            summary=f"Agent {agent.name} wurde bei Bewegung nach ({blocked_pos.x}, {blocked_pos.y}) von {blocker.name} blockiert.",
-                            payload={
-                                "incident_id": incident_id,
-                                "attempted_pos": {"x": blocked_pos.x, "y": blocked_pos.y},
-                                "blocked_by_agent_id": blocker.id,
-                            },
-                        )
-                    )
-
                     agent.memory.update_entity_perception(
                         entity_id=blocker.id,
                         name=blocker.name,
                         pos=blocker.position,
                         tick=current_tick,
                     )
-
-                    if isinstance(blocker, Agent) or blocker.is_conversational:
-                        agent.memory.record_inspection(blocker.id, blocker.entity_type)
-                        agent.memory.record_walkability_result(blocker.id, is_walkable=False)
-
-                    received = [m.to_dict() for m in agent.drain_inbox(assimilate=True, tick=current_tick)]
-
-                    active_goal = agent.active_goal
-                    target_pos = (
-                        active_goal.target_position
-                        if active_goal and active_goal.target_position
-                        else (agent.path[-1] if agent.has_path else None)
-                    )
-
-                    test_path: list[Position] = []
-                    if target_pos:
-                        test_path = self._pathfinder.find_path(agent.position, target_pos, agent.mental_map)
-
-                    stack_repr = [
-                        f"Ebene {idx}: {g.name} (Status: {g.status}, Koordinate: {g.target_position})"
-                        for idx, g in enumerate(agent.goals)
-                    ]
 
                     allow_talk = agent.memory.can_talk(blocker.id)
                     allow_probe = agent.memory.can_probe(blocker.id)
@@ -163,83 +133,29 @@ class ConflictCoordinator(IConflictCoordinator):
                     fact = agent.memory.known_entities.get(blocker.id)
                     known_type = fact.entity_type if fact else None
                     belief = agent.memory.type_beliefs.get(known_type) if known_type else None
+                    empirical_summary = (
+                        f"Kategorie '{known_type}': {belief.empirical_walkability}; {belief.empirical_conversational}"
+                        if belief
+                        else "Keine empirischen Typ-Erfahrungen vorhanden."
+                    )
 
-                    individual_walkable = agent.memory.get_entity_walkability(blocker.id)
-                    if individual_walkable is False:
-                        walkability_text = (
-                            f"Dieses konkrete Objekt wurde bereits erprobt und ist UNPASSIERBAR. "
-                            f"(Kategorie '{known_type}': {belief.empirical_walkability if belief else 'Keine Daten'})"
-                        )
-                    elif individual_walkable is True:
-                        walkability_text = (
-                            f"Dieses konkrete Objekt wurde bereits erprobt und ist PASSIERBAR. "
-                            f"(Kategorie '{known_type}': {belief.empirical_walkability if belief else 'Keine Daten'})"
-                        )
-                    else:
-                        walkability_text = (
-                            belief.empirical_walkability
-                            if belief
-                            else "Bisher keine Erfahrungswerte zu diesem Typ"
-                        )
-
-                    # Reduzierter Kontext für Kognitions-Provider (Kontextreduktion)
+                    current_goal = agent.active_goal
                     context = {
                         "agent_id": agent.id,
                         "name": agent.name,
                         "blocker_id": blocker.id,
                         "blocker_name": blocker.name,
                         "blocker_inspected": inspected,
-                        "blocker_entity_type": known_type or "unbekannt",
-                        "blocker_memory_status": agent.memory.get_fact_text(blocker.id),
-                        "empirical_walkability": walkability_text,
-                        "empirical_conversational": (
-                            belief.empirical_conversational
-                            if belief
-                            else "Bisher keine Erfahrungswerte zu diesem Typ"
-                        ),
                         "allow_talk": allow_talk,
                         "allow_probe": allow_probe,
-                        "current_x": agent.position.x,
-                        "current_y": agent.position.y,
-                        "blocked_x": blocked_pos.x,
-                        "blocked_y": blocked_pos.y,
-                        "energy": agent.energy,
-                        "goal_stack": stack_repr,
-                        "active_goal": agent.active_goal.to_dict() if agent.active_goal else None,
-                        "can_reroute": bool(test_path),
-                        "received_messages": received,
-                        "recent_dialogues": self._dialogue_history.get_recent_formatted(limit=3),
+                        "empirical_record": empirical_summary,
+                        "current_pos": [agent.position.x, agent.position.y],
+                        "blocked_pos": [blocked_pos.x, blocked_pos.y],
+                        "active_goal": current_goal.name if current_goal else "Keines",
                     }
-
-                    self._logger.log(
-                        SimulationEvent(
-                            tick=current_tick,
-                            agent_id=agent.id,
-                            event_type="cognition_started",
-                            summary=f"Agent {agent.name} startet Inferenz zur Blockadelösung mit {blocker.name}.",
-                            payload={
-                                "incident_id": incident_id,
-                                "context_snapshot": {
-                                    "blocked_pos": {"x": blocked_pos.x, "y": blocked_pos.y},
-                                    "can_reroute": bool(test_path),
-                                    "allow_talk": allow_talk,
-                                    "allow_probe": allow_probe,
-                                    "inspected": inspected,
-                                },
-                            },
-                        )
-                    )
 
                     start_time = time.perf_counter()
                     resolution: BlockedResolution = await self._cognition_provider.resolve_blockage(context)
-
-                    if isinstance(resolution.action, (TalkAction, InspectAction, ProbeAction)):
-                        if resolution.action.target_agent_id == agent.id or resolution.action.target_agent_id not in (
-                            blocker.id,
-                            blocker.name,
-                        ):
-                            resolution.action.target_agent_id = blocker.id
-
                     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
                     if resolution.complete_sub_goal and len(agent.goals) > 1:
@@ -256,28 +172,19 @@ class ConflictCoordinator(IConflictCoordinator):
                             sub_goal_name=resolution.new_sub_goal,
                         )
 
+                    # TOCTOU-gesicherte Ausführung
                     self._action_executor.execute_blockage_action(
                         agent=agent,
                         blocker=blocker,
-                        blocked_pos=blocked_pos,
                         action=resolution.action,
                         incident_id=incident_id,
-                        duration_ms=duration_ms,
-                        thought=resolution.thought,
                         all_entities=all_entities,
+                        blocked_pos=blocked_pos,
+                        current_tick=current_tick,
+                        thought=resolution.thought,
+                        duration_ms=duration_ms,
                     )
 
-                except Exception as err:
-                    agent.is_waiting_for_reply = False
-                    self._logger.log(
-                        SimulationEvent(
-                            tick=self._tick_provider(),
-                            agent_id=agent.id,
-                            event_type="cognition_failed",
-                            summary=f"Kognitionsfehler bei Agent {agent.name}: {err}.",
-                            payload={"incident_id": incident_id, "error": str(err)},
-                        )
-                    )
                 finally:
                     if isinstance(blocker, Agent):
                         blocker.is_listening_to_peer = False

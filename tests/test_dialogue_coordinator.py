@@ -172,6 +172,11 @@ async def test_dialogue_symmetric_offer_yield_suppresses_redundant_evasion(dialo
     assert "evasion_suppressed" in logged_event_types
     assert alice.active_goal.name == "Ost-Tor"
 
+    bob.commit_staging_messages()
+    assert len(bob.inbox) == 1
+    assert bob.inbox[0].intent == "accept"
+    assert bob.inbox[0].message == "Danke, ich passiere."
+
 
 @pytest.mark.asyncio
 async def test_dialogue_circuit_breaker_arbitration_on_turn_limit(dialogue_setup) -> None:
@@ -247,3 +252,133 @@ async def test_dialogue_arbitration_equal_distance_resolves_deterministically(di
     cognition.respond_to_dialogue.assert_not_awaited()
     # Bei Distanzgleichstand len_self <= len_partner greift deterministisch 'yield'
     assert alice.active_goal.name == "In Nische ausweichen"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_accept_received_by_yielding_agent_terminates_without_reply(dialogue_setup) -> None:
+    # TC-NEG-06: Wenn der Agent bereits ausweicht und der Partner 'accept' sendet,
+    # wird die Einigung terminal bestätigt: keine LLM-Anfrage, keine Antwortnachricht.
+    coordinator, cognition, session_manager, logger = dialogue_setup
+
+    alice = Agent(id="1", name="Alice", position=Position(5, 5))
+    bob = Agent(id="2", name="Bob", position=Position(6, 5))
+    bob.push_goal(
+        Goal(
+            name="In Nische ausweichen",
+            target_position=Position(6, 4),
+            yield_for_agent_id="1",
+        )
+    )
+    bob.is_waiting_for_reply = True
+    bob.interaction_partner_id = "1"
+    session_manager.increment_turn("2", "1")
+
+    bob.receive_message(
+        IncomingMessage(
+            from_agent_id="1",
+            from_agent_name="Alice",
+            message="Danke, ich passiere.",
+            intent="accept",
+        )
+    )
+
+    await coordinator.handle_incoming_dialogue(bob, [alice, bob])
+
+    # Kognition wurde nicht befragt
+    cognition.respond_to_dialogue.assert_not_awaited()
+
+    # Alice hat keine Nachricht zurückerhalten (weder in inbox noch staging_inbox)
+    alice.commit_staging_messages()
+    assert len(alice.inbox) == 0
+
+    # Event wurde geloggt
+    logged_event_types = [call.args[0].event_type for call in logger.log.call_args_list]
+    assert "dialogue_agreement_confirmed" in logged_event_types
+
+    # Wartezustände und Session wurden zurückgesetzt
+    assert bob.is_waiting_for_reply is False
+    assert bob.interaction_partner_id is None
+    assert session_manager.get_turn_count("2", "1") == 0
+
+
+@pytest.mark.asyncio
+async def test_dialogue_mutual_accept_terminates_without_dispatching_talk_reply(dialogue_setup) -> None:
+    # TC-NEG-07: Wenn ein Agent auf ein eingehendes 'accept' ebenfalls mit 'accept' reagiert,
+    # wird keine weitere TalkAction an den Partner dispatcht (Verhinderung der accept-Echo-Schleife).
+    coordinator, cognition, session_manager, _ = dialogue_setup
+
+    alice = Agent(id="1", name="Alice", position=Position(5, 5))
+    bob = Agent(id="2", name="Bob", position=Position(6, 5))
+
+    alice.receive_message(
+        IncomingMessage(
+            from_agent_id="2",
+            from_agent_name="Bob",
+            message="Ich stimme dem Vorschlag zu.",
+            intent="accept",
+        )
+    )
+
+    cognition.respond_to_dialogue.return_value = DialogueResolution(
+        thought="Wir sind uns einig.",
+        action=TalkAction(
+            target_agent_id="2",
+            message="Ich stimme dem Vorschlag zu.",
+            reason="Einigung",
+        ),
+        negotiation_intent="accept",
+    )
+
+    await coordinator.handle_incoming_dialogue(alice, [alice, bob])
+
+    # Bob erhält keine neue Nachricht, die ihn erneut triggern würde
+    bob.commit_staging_messages()
+    assert len(bob.inbox) == 0
+
+    # Session wurde zurückgesetzt
+    assert session_manager.get_turn_count("1", "2") == 0
+    assert alice.is_waiting_for_reply is False
+
+
+@pytest.mark.asyncio
+async def test_dialogue_accept_offer_yield_clears_waiting_flags_and_allows_movement(dialogue_setup) -> None:
+    # TC-NEG-08: Wenn Alice Bobs Ausweichangebot annimmt, werden ihre Wartezustände
+    # vollständig freigegeben, sodass sie nicht blockiert ist und den Chokepoint passieren kann.
+    coordinator, cognition, session_manager, _ = dialogue_setup
+
+    alice = Agent(id="1", name="Alice", position=Position(5, 5))
+    alice.push_goal(Goal(name="Ost-Tor", target_position=Position(10, 5)))
+    alice.is_waiting_for_reply = True
+    alice.interaction_partner_id = "2"
+
+    bob = Agent(id="2", name="Bob", position=Position(6, 5))
+    bob.push_goal(
+        Goal(
+            name="In Nische ausweichen",
+            target_position=Position(6, 4),
+            yield_for_agent_id="1",
+        )
+    )
+
+    alice.receive_message(
+        IncomingMessage(
+            from_agent_id="2",
+            from_agent_name="Bob",
+            message="Ich weiche aus.",
+            intent="offer_yield",
+        )
+    )
+
+    cognition.respond_to_dialogue.return_value = DialogueResolution(
+        thought="Bob weicht aus, ich passiere.",
+        action=TalkAction(target_agent_id="2", message="Danke, ich passiere.", reason="Passieren"),
+        negotiation_intent="accept",
+    )
+
+    await coordinator.handle_incoming_dialogue(alice, [alice, bob])
+
+    # Alices Wartezustände sind vollständig gelöst
+    assert alice.is_waiting_for_reply is False
+    assert alice.interaction_partner_id is None
+    assert alice.is_busy is False
+    assert session_manager.get_turn_count("1", "2") == 0
