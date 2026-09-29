@@ -38,7 +38,8 @@ class EvasionFinder:
     ) -> Optional[EvasionResult]:
         """Ermittelt per 3-Stufen-Kaskade das Ausweichfeld und den Schnittpunkt zur Räumung."""
         trajectory_set = set(partner_trajectory) if partner_trajectory else set()
-        forbidden: set[Position] = set(occupied_positions) | {blocked_pos} | trajectory_set
+        physical_obstacles: set[Position] = set(occupied_positions) - {blocked_pos}
+        forbidden_targets: set[Position] = set(occupied_positions) | {blocked_pos} | trajectory_set
 
         queue: list[Position] = [start]
         visited: set[Position] = {start}
@@ -50,7 +51,7 @@ class EvasionFinder:
         while queue:
             current = queue.pop(0)
 
-            if current != start and current not in forbidden and self._is_known_walkable(grid, current):
+            if current != start and current not in forbidden_targets and self._is_known_walkable(grid, current):
                 dist = start.manhattan_distance(current)
                 if dist <= 3:
                     stage1_match = current
@@ -59,8 +60,7 @@ class EvasionFinder:
                     stage2_match = current
 
             for neighbor in current.get_neighbors():
-                # neighbor darf nicht in forbidden liegen, um Traversierung blockierter Entitäten auszuschließen
-                if neighbor not in visited and neighbor not in forbidden and grid.is_within_bounds(neighbor):
+                if neighbor not in visited and neighbor not in physical_obstacles and grid.is_within_bounds(neighbor):
                     visited.add(neighbor)
                     if self._is_known_walkable(grid, neighbor):
                         came_from[neighbor] = current

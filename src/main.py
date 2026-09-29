@@ -1,109 +1,133 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+from pathlib import Path
 from typing import Literal
+
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+
+if sys.prefix == sys.base_prefix:
+    venv_python = project_root / ".venv" / "bin" / "python3"
+    if venv_python.exists():
+        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
+from src.application.services.world_loader import WorldLoader
 from src.container import ApplicationContainer
-from src.domain.models.agent import Agent
 from src.domain.models.position import Position
-from src.domain.models.world_entity import WorldEntity
+from src.domain.models.world_definition import (
+    PlacedAgentData,
+    PlacedEntityData,
+    WorldDefinition,
+)
+from src.infrastructure.repositories.json_world_repository import JsonWorldRepository
 
 
-def build_labyrinth(container: ApplicationContainer) -> None:
-    grid = container.grid
+def create_default_labyrinth_definition() -> WorldDefinition:
+    """Erzeugt die Standard-Labyrinth-Definition als Fallback."""
+    obstacles: list[Position] = []
 
-    # 1. Äußere Grenzwände (90x45)
+    # 1. Grenzwände
     for x in range(90):
-        grid.set_obstacle(Position(x, 0))
-        grid.set_obstacle(Position(x, 44))
+        obstacles.append(Position(x, 0))
+        obstacles.append(Position(x, 44))
     for y in range(45):
-        grid.set_obstacle(Position(0, y))
-        grid.set_obstacle(Position(89, y))
+        obstacles.append(Position(0, y))
+        obstacles.append(Position(89, y))
 
-    # 2. Vertikale Barriere 1 (x=15) - Durchgang unten (y: 36..43)
+    # 2. Barrieren
     for y in range(1, 36):
-        grid.set_obstacle(Position(15, y))
+        obstacles.append(Position(15, y))
     for x in range(1, 11):
-        grid.set_obstacle(Position(x, 28))
+        obstacles.append(Position(x, 28))
 
-    # 3. Vertikale Barriere 2 (x=30) - Durchgang oben (y: 1..8)
     for y in range(9, 44):
-        grid.set_obstacle(Position(30, y))
+        obstacles.append(Position(30, y))
     for x in range(16, 26):
-        grid.set_obstacle(Position(x, 20))
+        obstacles.append(Position(x, 20))
 
-    # 4. Vertikale Barriere 3 (x=45) - Mittlerer Pfad mit Chokepoint und Umweg unten
     for y in range(1, 21):
-        grid.set_obstacle(Position(45, y))
-    grid.set_obstacle(Position(45, 21))
-    grid.set_obstacle(Position(45, 23))
+        obstacles.append(Position(45, y))
+    obstacles.append(Position(45, 21))
+    obstacles.append(Position(45, 23))
     for y in range(24, 36):
-        grid.set_obstacle(Position(45, y))
+        obstacles.append(Position(45, y))
 
-    # Führungskorridor vor dem Hindernis bei y=22 mit Ausweichnische bei (44, 20)
     for x in range(38, 45):
         if x != 44:
-            grid.set_obstacle(Position(x, 20))
-        grid.set_obstacle(Position(x, 24))
+            obstacles.append(Position(x, 20))
+        obstacles.append(Position(x, 24))
 
-    # 5. Vertikale Barriere 4 (x=60) - Durchgang oben (y: 1..8)
     for y in range(9, 44):
-        grid.set_obstacle(Position(60, y))
+        obstacles.append(Position(60, y))
     for x in range(48, 57):
-        grid.set_obstacle(Position(x, 22))
+        obstacles.append(Position(x, 22))
 
-    # 6. Vertikale Barriere 5 (x=75) - Durchgang unten (y: 36..43)
     for y in range(1, 36):
-        grid.set_obstacle(Position(75, y))
+        obstacles.append(Position(75, y))
     for x in range(76, 86):
-        grid.set_obstacle(Position(x, 15))
+        obstacles.append(Position(x, 15))
 
-    # 7. Statische Felsblöcke
-    scattered_rocks = [
-        Position(7, 10),
-        Position(22, 35),
-        Position(36, 12),
-        Position(52, 30),
-        Position(68, 18),
-        Position(82, 32),
+    for rock in [Position(7, 10), Position(22, 35), Position(36, 12), Position(52, 30), Position(68, 18), Position(82, 32)]:
+        obstacles.append(rock)
+
+    entities = [
+        PlacedEntityData(
+            id="stone_1",
+            name="Großer Stein",
+            blueprint_id="rock",
+            position=Position(45, 22),
+            entity_type="rock",
+            is_conversational=False,
+        )
     ]
-    for rock in scattered_rocks:
-        grid.set_obstacle(rock)
+
+    agents = [
+        PlacedAgentData(
+            id="1",
+            name="Alice",
+            position=Position(2, 22),
+            target_position=Position(87, 22),
+            destination_name="Ost-Tor",
+        )
+    ]
+
+    return WorldDefinition(
+        name="Labyrinth",
+        width=90,
+        height=45,
+        obstacles=obstacles,
+        entities=entities,
+        agents=agents,
+    )
 
 
 async def main() -> None:
-    # Wähle die Konfliktlösungs-Strategie:
-    # "action_masking" = A1 (Pydantic-Schema schließt 'talk' aus)
-    # "reflection"     = A3 (Kognitive Korrekturschleife bei Fehlentscheidungen)
     strategy: Literal["action_masking", "reflection"] = "action_masking"
+    world_name = "labyrinth3"
+
+    world_repo = JsonWorldRepository(project_root / "data" / "worlds")
+
+    # Welt laden oder Fallback generieren und persistieren
+    try:
+        world = world_repo.load(world_name)
+    except FileNotFoundError:
+        world = create_default_labyrinth_definition()
+        world_repo.save(world, world_name)
 
     container = ApplicationContainer.build(
-        width=90,
-        height=45,
+        width=world.width,
+        height=world.height,
         tick_interval=0.15,
         blockage_strategy=strategy,
     )
-    build_labyrinth(container)
 
-    alice = Agent(id="1", name="Alice", position=Position(2, 22))
-    container.engine.register_agent(alice)
+    # Deterministische Befüllung ohne prozedurale Schleifen in main
+    WorldLoader.apply_to_container(world, container)
 
-    container.engine.set_agent_target(
-        agent_id="1",
-        target=Position(87, 22),
-        destination_name="Ost-Tor",
-    )
-
-    # src/main.py
-    stone = WorldEntity(
-        id="stone_1",
-        name="Großer Stein",
-        position=Position(45, 22),
-        entity_type="rock",  # Expliziter Typ statt "generic"
-        is_conversational=False,
-    )
-    container.engine.register_entity(stone)
-
-    await container.engine.run(max_ticks=400)
+    await container.engine.run(max_ticks=600)
 
 
 if __name__ == "__main__":

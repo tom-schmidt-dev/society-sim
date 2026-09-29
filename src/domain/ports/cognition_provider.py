@@ -7,7 +7,8 @@ from src.domain.models.cognition import (
     GoalDecision,
     GoalEvaluation,
 )
-
+from abc import ABC, abstractmethod
+from src.domain.models.planning import AgentCognitiveContext, PlanDecomposition
 
 class ICognitionProvider(ABC):
     @abstractmethod
@@ -29,3 +30,10 @@ class ICognitionProvider(ABC):
     async def respond_to_dialogue(self, context: dict[str, Any]) -> DialogueResolution:
         """Erzeugt eine Antwort oder beendet den Dialog auf Basis empfangener Nachrichten."""
         pass
+
+    async def decompose_plan(
+            self, context: AgentCognitiveContext
+    ) -> PlanDecomposition:
+        """Zerlegt den Kognitionskontext eines Agenten in ein Primärziel und Teilziele."""
+        pass
+

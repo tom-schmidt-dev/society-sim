@@ -12,6 +12,13 @@ from src.domain.models.cognition import (
     GoalEvaluation,
 )
 from src.domain.ports.cognition_provider import ICognitionProvider
+from pydantic import BaseModel
+from src.domain.models.planning import (
+    ActionType,
+    AgentCognitiveContext,
+    PlanDecomposition,
+    SubGoalIntent,
+)
 
 
 class InstructorCognitionAdapter(ICognitionProvider):
@@ -203,3 +210,80 @@ class InstructorCognitionAdapter(ICognitionProvider):
         params = self._build_request_params(DialogueResolution, messages)
         resolution: DialogueResolution = await self._client.chat.completions.create(**params)
         return resolution
+
+    async def decompose_plan(
+            self, context: AgentCognitiveContext
+    ) -> PlanDecomposition:
+        system_prompt = (
+            "Du bist das Kognitions- und Planungsmodul eines autonomen Agenten in einer 2D-Gitter-Simulation.\n"
+            "Deine Aufgabe ist es, für ein dringendes Bedürfnis des Agenten (z. B. 'hunger') einen strukturierten Handlungsplan zu erstellen.\n"
+            "Analysiere die Vitalwerte, die aktuelle Position und die bekannten Entitäten.\n"
+            "Formuliere deine Gedanken im Feld 'thought', benenne ein Primärziel ('primary_goal') "
+            "und zerlege es in eine geordnete Liste von atomaren Teilzielen ('sub_goals').\n\n"
+            "Zulässige Aktionen für Sub-Goals sind: 'move_to', 'explore', 'consume', 'wait', 'inspect'.\n"
+            "Regeln:\n"
+            "1. Wenn keine passende Ressource bekannt ist, muss zuerst 'explore' gewählt werden.\n"
+            "2. Wenn eine passende Ressource bekannt ist, plane 'move_to' gefolgt von 'consume'.\n"
+            "3. Gib bei 'move_to' die Zielkoordinaten [x, y] und bei 'consume' die target_entity_id an."
+        )
+
+        user_content = (
+            context.model_dump_json(indent=2)
+            if isinstance(context, BaseModel)
+            else json.dumps(context, ensure_ascii=False)
+        )
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        params = self._build_request_params(PlanDecomposition, messages)
+        try:
+            decomposition: PlanDecomposition = await self._client.chat.completions.create(**params)
+            return decomposition
+        except Exception:
+            # Robuster Fallback bei Offline-Betrieb oder Verbindungsabbrüchen
+            return self._heuristic_fallback_plan(context)
+
+    def _heuristic_fallback_plan(
+            self, context: AgentCognitiveContext
+    ) -> PlanDecomposition:
+        """Deterministischer Fallback-Planer bei nicht erreichbarem Sprachmodell."""
+        consumable = next(
+            (e for e in context.known_entities if e.is_consumable and e.last_known_position),
+            None,
+        )
+        if consumable and consumable.last_known_position:
+            target_pos = (consumable.last_known_position.x, consumable.last_known_position.y)
+            return PlanDecomposition(
+                thought="Fallback: Bekannte Ressource direkt ansteuern und konsumieren.",
+                primary_goal="Hunger stillen",
+                sub_goals=[
+                    SubGoalIntent(
+                        action_type=ActionType.MOVE_TO,
+                        target_position=target_pos,
+                        description=f"Gehe zu {consumable.name}",
+                    ),
+                    SubGoalIntent(
+                        action_type=ActionType.CONSUME,
+                        target_entity_id=consumable.entity_id,
+                        description=f"Konsumiere {consumable.name}",
+                    ),
+                ],
+            )
+
+        return PlanDecomposition(
+            thought="Fallback: Keine Ressource bekannt. Starte Exploration.",
+            primary_goal="Nahrung suchen",
+            sub_goals=[
+                SubGoalIntent(
+                    action_type=ActionType.EXPLORE,
+                    description="Erkunde unbekanntes Terrain nach Nahrung",
+                ),
+                SubGoalIntent(
+                    action_type=ActionType.CONSUME,
+                    description="Konsumiere gefundene Nahrung",
+                ),
+            ],
+        )

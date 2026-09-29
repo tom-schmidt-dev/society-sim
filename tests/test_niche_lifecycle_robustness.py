@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from src.application.services.action_executor import ActionExecutor
 from src.application.services.dialogue_history import DialogueHistory
 from src.application.services.dialogue_session_manager import DialogueSessionManager
@@ -11,6 +11,7 @@ from src.application.simulation_engine import SimulationEngine
 from src.domain.models.agent import Agent
 from src.domain.models.cognition import GoalEvaluation
 from src.domain.models.goal import Goal
+from src.domain.models.mental_map import AgentMentalMap
 from src.domain.models.message import IncomingMessage
 from src.domain.models.position import Position
 from src.domain.models.world import WorldGrid
@@ -19,16 +20,16 @@ from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
 from src.domain.services.perception_service import PerceptionService
+from src.infrastructure.pathfinding.astar import AStarPathfinder
 
 
 @pytest.fixture
 def mocked_env():
     grid = MagicMock(spec=WorldGrid)
-    # Standardmäßig ist alles begehbar und innerhalb der Grenzen
     grid.is_walkable.return_value = True
     grid.is_within_bounds.return_value = True
     grid.width = 50
-    grid.height = 10
+    grid.height = 50
 
     logger = MagicMock(spec=IEventLogger)
     presenter = MagicMock(spec=IPresenter)
@@ -37,7 +38,6 @@ def mocked_env():
     dialogue_history = MagicMock(spec=DialogueHistory)
     perception = MagicMock(spec=PerceptionService)
 
-    # Standard-Pfadfinder liefert eine valide Schrittsequenz
     pathfinder.find_path.side_effect = lambda start, goal, mmap: [goal]
 
     current_tick = 100
@@ -48,7 +48,6 @@ def mocked_env():
         tick_provider=lambda: current_tick,
     )
     evasion_finder = EvasionFinder(pathfinder=pathfinder)
-    session_manager = DialogueSessionManager(max_dialogue_turns=2)
 
     executor = ActionExecutor(
         grid=grid,
@@ -94,7 +93,6 @@ async def test_sub_goal_evaluation_must_never_pop_evasion_hold(mocked_env) -> No
     evaluate_sub_goal_completion entfernt werden, sondern NUR durch ein Signal.
     """
     env = mocked_env
-    engine: SimulationEngine = env["engine"]
     cognition: AsyncMock = env["cognition"]
     goal_service: GoalService = env["goal_service"]
 
@@ -109,22 +107,18 @@ async def test_sub_goal_evaluation_must_never_pop_evasion_hold(mocked_env) -> No
     )
     alice.push_goal(hold_goal)
 
-    # Das LLM behauptet fälschlicherweise: Ziel ist abgeschlossen!
     cognition.evaluate_goal_status.return_value = GoalEvaluation(
         thought="Partner ist noch da, aber ich bin in der Nische, also fertig.",
         is_completed=True,
         reason="Nische erreicht",
     )
 
-    # Wenn GoalService aufgerufen wird:
     await goal_service.evaluate_sub_goal_completion(
         agent=alice,
         grid=env["grid"],
         recent_dialogues=[],
     )
 
-    # Absicherung: Das Halteziel MUSS trotzdem erhalten bleiben,
-    # da is_evasion_hold geschützt sein muss, bis Clearance erfolgt!
     assert alice.active_goal is not None
     assert alice.active_goal.name == "Nischen-Halt"
     assert alice.active_goal.is_evasion_hold is True
@@ -136,23 +130,19 @@ async def test_sub_goal_evaluation_must_never_pop_evasion_hold(mocked_env) -> No
 def test_junction_must_be_strictly_adjacent_to_evasion_tile() -> None:
     """
     Reproduziert den Fehler im Live-Run, bei dem junction_position=(9,22) berechnet
-    wurde, obwohl Start bei (44,22) und Nische bei (43,20) lag.
+    wurde, obwohl Start bei (44,22) und Nische bei (45,21) lag.
     """
-    pathfinder = MagicMock(spec=IPathfinder)
+    pathfinder = AStarPathfinder()
     evasion_finder = EvasionFinder(pathfinder=pathfinder)
 
-    from src.domain.models.mental_map import AgentMentalMap
     mmap = AgentMentalMap(width=90, height=30)
-    # Flur auf y=22
     for x in range(90):
         mmap.update_tile(Position(x, 22), is_walkable=True, tick=1)
-    # Nische bei (45, 21)
     mmap.update_tile(Position(45, 21), is_walkable=True, tick=1)
 
     start = Position(44, 22)
     blocked_pos = Position(45, 22)
 
-    # Bob's Trajektorie reicht von 87 bis 2 auf y=22
     partner_trajectory = [Position(x, 22) for x in range(87, 1, -1)]
 
     res = evasion_finder.find_nearest_evasion_tile(
@@ -164,8 +154,6 @@ def test_junction_must_be_strictly_adjacent_to_evasion_tile() -> None:
     )
 
     assert res is not None
-    # Die Junction MUSS auf der gemeinsamen Achse unmittelbar vor der Nische liegen!
-    # Keinesfalls darf sie weit hinten bei x=9 liegen!
     assert res.junction_tile.y == 22
     assert abs(res.junction_tile.x - res.target_tile.x) <= 1
     assert res.target_tile == Position(45, 21)
@@ -253,11 +241,9 @@ async def test_no_stacked_niche_holds_on_subsequent_ticks(mocked_env) -> None:
         )
     )
 
-    # 5 Ticks vergehen, während Alice auf der Zielkachel steht
     for _ in range(5):
         await engine.process_tick()
 
-    # Es darf exakt nur 1 'Nischen-Halt' auf dem Stack liegen!
     hold_goals = [g for g in alice.goals if g.name == "Nischen-Halt"]
     assert len(hold_goals) == 1
     assert len(alice.goals) == 2

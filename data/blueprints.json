@@ -1,0 +1,88 @@
+[
+  {
+    "id": "wall",
+    "name": "Wand (Statisch)",
+    "category": "obstacle",
+    "entity_type": "wall",
+    "is_conversational": false,
+    "is_obstacle": true,
+    "color": "#2D3748",
+    "char": "#",
+    "default_properties": {}
+  },
+  {
+    "id": "rock",
+    "name": "Großer Stein",
+    "category": "entity",
+    "entity_type": "rock",
+    "is_conversational": false,
+    "is_obstacle": true,
+    "color": "#718096",
+    "char": "O",
+    "default_properties": {}
+  },
+  {
+    "id": "agent",
+    "name": "Agent (Alice)",
+    "category": "agent",
+    "entity_type": "agent",
+    "is_conversational": true,
+    "is_obstacle": true,
+    "color": "#3182CE",
+    "char": "A",
+    "default_properties": {}
+  },
+  {
+    "id": "target",
+    "name": "Ziel (Ost-Tor)",
+    "category": "obstacle",
+    "entity_type": "target",
+    "is_conversational": false,
+    "is_obstacle": false,
+    "color": "#38A169",
+    "char": "X",
+    "default_properties": {}
+  },
+  {
+    "id": "poison_bush",
+    "name": "Giftiger Buscha",
+    "category": "agent",
+    "entity_type": "bush",
+    "is_conversational": true,
+    "is_obstacle": true,
+    "color": "#805a2c",
+    "char": "A",
+    "default_properties": {
+      "agent_id": "poison_bush",
+      "name": "Giftiger Buscha"
+    }
+  },
+  {
+    "id": "poison_bush2",
+    "name": "Giftiger Buscha",
+    "category": "agent",
+    "entity_type": "bush",
+    "is_conversational": true,
+    "is_obstacle": true,
+    "color": "#805a2c",
+    "char": "A",
+    "default_properties": {
+      "agent_id": "poison_bush2",
+      "name": "Giftiger Buscha"
+    }
+  },
+  {
+    "id": "agentone",
+    "name": "Giftiger Busch",
+    "category": "agent",
+    "entity_type": "agentone",
+    "is_conversational": true,
+    "is_obstacle": true,
+    "color": "#805AD5",
+    "char": "%",
+    "default_properties": {
+      "agent_id": "agentone",
+      "name": "Giftiger Busch"
+    }
+  }
+]

@@ -24,6 +24,7 @@ from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
 from src.domain.services.perception_service import PerceptionService
+from src.infrastructure.pathfinding.astar import AStarPathfinder
 
 
 @pytest.fixture
@@ -93,7 +94,7 @@ class TestAgentStateAndPriorities:
         paused = service.pause_goal(agent)
         assert paused == coop_goal
         assert coop_goal.status == "paused"
-        # Nach Pausierung ist das darunterliegende aktive Ziel aktiv
+        # Nach Pausierung ist das darunterliegende Ziel aktiv
         assert agent.active_goal == routine_goal
 
         # Reaktivierung
@@ -107,10 +108,9 @@ class TestAgentStateAndPriorities:
 # 2. Test-Klasse: EvasionFinder & Geometrie-Reparatur
 # ---------------------------------------------------------------------------
 class TestEvasionFinderGeometry:
-    def test_evasion_finder_traverses_blocked_pos_neighbor_to_reach_niche(
-        self, mock_pathfinder: MagicMock
-    ) -> None:
-        finder = EvasionFinder(mock_pathfinder)
+    def test_evasion_finder_traverses_blocked_pos_neighbor_to_reach_niche(self) -> None:
+        pathfinder = AStarPathfinder()
+        finder = EvasionFinder(pathfinder)
         mmap = AgentMentalMap(width=50, height=30)
 
         for x in range(50):
@@ -288,7 +288,7 @@ class TestInteractionQueueMechanics:
         goal_service = GoalService(mock_logger, mock_cognition, mock_pathfinder)
         evasion_finder = EvasionFinder(mock_pathfinder)
         action_executor = ActionExecutor(
-            grid, mock_logger, dialogue_history, goal_service, mock_pathfinder, evasion_finder
+            grid, mock_logger, dialogue_history, goal_service, mock_pathfinder, evasion_finder=evasion_finder
         )
 
         coordinator = ConflictCoordinator(

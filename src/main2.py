@@ -1,7 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+from pathlib import Path
 from typing import Literal
+
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+
+if sys.prefix == sys.base_prefix:
+    venv_python = project_root / ".venv" / "bin" / "python3"
+    if venv_python.exists():
+        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
 from src.container import ApplicationContainer
 from src.domain.models.agent import Agent
 from src.domain.models.position import Position

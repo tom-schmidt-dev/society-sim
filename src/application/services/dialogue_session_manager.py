@@ -19,6 +19,7 @@ class DialogueSessionManager:
         self._logger: Optional[IEventLogger] = logger
         self._conversation_locks: dict[tuple[str, ...], asyncio.Lock] = {}
         self._dialogue_turns: dict[tuple[str, ...], int] = {}
+        self._last_negotiated_tick: dict[tuple[str, ...], int] = {}
 
     @property
     def max_dialogue_turns(self) -> int:
@@ -57,8 +58,7 @@ class DialogueSessionManager:
         try:
             await asyncio.wait_for(lock.acquire(), timeout=effective_timeout)
             acquired = True
-            yield True
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             if self._logger:
                 self._logger.log(
                     SimulationEvent(
@@ -74,6 +74,10 @@ class DialogueSessionManager:
                     )
                 )
             yield False
+            return
+
+        try:
+            yield True
         finally:
             if acquired and lock.locked():
                 lock.release()
@@ -94,3 +98,11 @@ class DialogueSessionManager:
     def reset_session(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> None:
         pair_key = self._get_pair_key(agent_a_id, agent_b_id)
         self._dialogue_turns.pop(pair_key, None)
+
+    def mark_negotiated(self, agent_a_id: str, agent_b_id: Optional[str] = None, tick: int = 0) -> None:
+        pair_key = self._get_pair_key(agent_a_id, agent_b_id)
+        self._last_negotiated_tick[pair_key] = tick
+
+    def was_negotiated_in_tick(self, agent_a_id: str, agent_b_id: Optional[str] = None, tick: int = 0) -> bool:
+        pair_key = self._get_pair_key(agent_a_id, agent_b_id)
+        return self._last_negotiated_tick.get(pair_key) == tick

@@ -280,3 +280,57 @@ Im Standardfall (z. B. Einzelagenten oder Konvois begegnen sich in einem Korrido
   - Clearance-Signal bei Zielankunft außerhalb vs. Blockade bei Zielankunft innerhalb des Korridors.
   - SHA-256-Münzwurf auf Prozess- und Replay-Stabilität.
   - Epistemische Persistenz: Beibehalten von statischem Geländewissen, Verwerfen flüchtiger Agentenpositionen.
+
+---
+
+### 8. OPERATIVE ROADMAP & PHASEN-TRACKING
+
+- [x] **Phase 1: Domänen-Grundlagen & Datenmodelle (`src/domain/`)**
+  - [x] 1.1 `Agent`-Attribute erweitern (`footprint`, `charisma`, `assertiveness`, `evasion_phase`) in `src/domain/models/agent.py`
+  - [x] 1.2 `EvasionPhase`-Zustandsmaschine definieren in `src/domain/models/evasion_phase.py`
+  - [x] 1.3 `Goal`-Modell erweitern (`is_group_goal`, `group_id`, `participant_ids`, `backtracking_junction_target`, Status `"suspended"`, `"re_evaluating"`) in `src/domain/models/goal.py`
+  - [x] 1.4 `FusedMentalMap` & Epistemische Persistenz in `src/domain/models/mental_map.py`
+  - [x] 1.5 Unit-Tests für Domänenmodelle (`tests/test_domain_convoy_models.py`) & Mypy-Check
+
+- [x] **Phase 2: Ziel-Lifecycle & Gruppen-Suspension (`GoalService`)**
+  - [x] 2.1 Konvoi-Suspension (`suspend_convoy_goals`), Prioritäts-Inversion (`ConvoyResolution`, Prio URGENT) in `src/application/services/goal_service.py`
+  - [x] 2.2 Kollektive Re-Validierung (`re_evaluating` -> `active`), Deadlock-Schutz (`MAX_SUSPENSION_TICKS = 1000`)
+  - [x] 2.3 Unit-Tests für Gruppen-Suspension (`tests/test_goal_service_convoy.py`) & Mypy-Check
+
+- [x] **Phase 3: Nutzenfunktion, SHA-256-Münzwurf & Deterministische Templates**
+  - [x] 3.1 Normalisierte Arbitrierung & Kostenberechnung ($\Delta C_{\text{total}}$, $\text{Advantage}_{\text{cost\_norm}}$, $\text{TraitScore}$, $\text{Score}$) in `src/application/services/convoy_arbitrator.py`
+  - [x] 3.2 Deterministischer SHA-256-Münzwurf `deterministic_coin_flip`
+  - [x] 3.3 Standardisierte Kommunikationstemplates in `src/domain/models/communication_templates.py`
+  - [x] 3.4 Unit-Tests für Nutzenfunktion & Münzwurf (`tests/test_convoy_arbitrator.py`) & Mypy-Check
+
+- [x] **Phase 4: Konvoikoordination, Permutation & Mid-Convoy Branching (`ConvoyCoordinator`)**
+  - [x] 4.1 Konvoikonstitution ($1 \le L_1 \le 2$, Richtungsvektor) & Leader-Bestimmung in `src/application/services/convoy_coordinator.py`
+  - [x] 4.2 Dynamische Permutation (Lateral Sidestep, Gap Closure, Re-Insertion)
+  - [x] 4.3 Mid-Convoy Branching & Drain (Reißverschlussverfahren Modus A & Blockwise Modus B)
+  - [x] 4.4 Backtracking-Protokoll bei Null-Nischen bis `backtracking_junction_target`
+  - [x] 4.5 Unit-Tests für Konvoikoordination (`tests/test_convoy_coordinator.py`) & Mypy-Check
+
+- [x] **Phase 5: Konvoi-Nischengeometrie (`MultiAgentNichePacker`)**
+  - [x] 5.1 Nischensuche & Kapazitätsaggregation ($\sum \text{Kapazität} \ge |G|$) in `src/application/services/multi_agent_niche_packer.py`
+  - [x] 5.2 Slot-Zuweisung & Korridordurchgängigkeits-Garantie
+  - [x] 5.3 Unit-Tests für Nischenpacker (`tests/test_multi_agent_niche_packer.py`) & Mypy-Check
+
+- [x] **Phase 6: Lokal beschränkter Zweiphasen-Commit (`MovementSyncService`)**
+  - [x] 6.1 Phase 1: Intent-Deklaration & Validierung zusammenhängender Konfliktkomponenten in `src/application/services/movement_sync_service.py`
+  - [x] 6.2 Validierungsreihenfolge: Front-to-Tail (Vorwärts) vs. Tail-to-Front (Backtracking)
+  - [x] 6.3 Phase 2: Atomare Grid-Übertragung nur für fehlerfreie Komponenten; isoliertes Verharren bei Konflikt
+  - [x] 6.4 Unit-Tests für Bewegungssynchronisation (`tests/test_movement_sync_service.py`) & Mypy-Check
+
+- [x] **Phase 7: Systemintegration & Topologische Konvoi-Clearance (`SimulationEngine`)**
+  - [x] 7.1 Integration von `MovementSyncService`, `ConvoyCoordinator`, `MultiAgentNichePacker` in `SimulationEngine`
+  - [x] 7.2 Topologische Konvoi-Clearance mit Korridorzonen-Ausschluss in `_check_and_signal_clearance`
+  - [x] 7.3 Integration in `src/container.py` (Composition Root)
+  - [x] 7.4 End-to-End-Integrationstests (`tests/test_convoy_corridor_scenarios.py`)
+  - [x] 7.5 Vollständige Regression, Mypy-Typechecking & Abschlussvalidierung
+
+- [x] **Phase 8: Runtime-Integration & Entkopplung der LLM-Inferenz im aktiven Ausführungspfad (`Integration.md`)**
+  - [x] 8.1 Composition Root (`src/container.py`): Instanziierung von `ConvoyArbitrator` und Injection in `SimulationEngine` & `ConflictCoordinator`.
+  - [x] 8.2 Entkopplung von LLM-Inferenz bei Korridorkonflikten (`ConflictCoordinator`): Deterministische FSM (`CONFLICT_DETECTED` -> `NEGOTIATING` -> `YIELDING_INGRESS`/`PASSING` -> `YIELDING_WAIT` -> `CLEARANCE_CONFIRMED` -> `EGRESS`) und stringente Emission von `DialogueTemplates`.
+  - [x] 8.3 Phasentrennung in `SimulationEngine`: `YIELDING_WAIT` bei Nischenankunft, `CLEARANCE_CONFIRMED` bei topologischer Clearance, `EGRESS` bei Quittungsempfang.
+  - [x] 8.4 Kognitionsinvariante: LLM-Inferenz (`resolve_blockage`) für stationäre und nicht-Agenten-Blockaden (`stone_1`) vollständig intakt.
+  - [x] 8.5 Test- und Typ-Verifikation: 54/54 Tests erfolgreich (`tests/test_live_corridor_deterministic_execution.py`, `tests/test_convoy*`, `tests/test_corridor_clearance.py`), 0 `mypy`-Fehler.

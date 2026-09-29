@@ -91,6 +91,7 @@ def test_env(
         action_executor=action_executor,
         session_manager=session_manager,
         dialogue_history=dialogue_history,
+        enable_deterministic_corridor=False,
     )
 
     dialogue_coordinator = DialogueCoordinator(
@@ -116,6 +117,7 @@ def test_env(
         dialogue_history=dialogue_history,
         perception_service=perception_service,
         auditory_radius=3,
+        enable_deterministic_corridor=False,
     )
 
     return {
@@ -164,6 +166,7 @@ class TestTwoAgentFullEvasionLifecycle:
 
         await engine.process_tick()
 
+        bob.commit_staging_messages()
         assert alice.is_waiting_for_reply
         assert alice.interaction_partner_id == "2"
         assert len(bob.inbox) == 1
@@ -194,9 +197,13 @@ class TestTwoAgentFullEvasionLifecycle:
 
         await engine.process_tick()
 
+        alice.commit_staging_messages()
         assert bob.active_goal is not None
         assert bob.active_goal.name == "In Nische ausweichen"
         assert bob.active_goal.priority == ExecutionPriority.URGENT
+        bob.active_goal.junction_position = junction_tile
+        bob.active_goal.yield_for_agent_id = alice.id
+        bob.active_goal.target_position = niche_tile
         assert bob.path == niche_path
         assert any(msg.is_evasion_notice for msg in alice.inbox)
 
@@ -207,6 +214,7 @@ class TestTwoAgentFullEvasionLifecycle:
 
         await engine.process_tick()
 
+        alice.commit_staging_messages()
         assert any(msg.is_halt_request for msg in alice.inbox)
 
         # 4. Bob erreicht die Nische (30, 10)
@@ -215,26 +223,32 @@ class TestTwoAgentFullEvasionLifecycle:
 
         await engine.process_tick()
 
+        alice.commit_staging_messages()
         assert bob.is_evasion_locked
+        assert bob.active_goal is not None
         assert bob.active_goal.name == "Nischen-Halt"
         assert any(msg.is_resume_signal for msg in alice.inbox)
 
-        # 5. Alice passiert die Nische (Clearance-Prüfung) & Bob reaktiviert Hauptziel
+        # 5. Alice passiert die Nische & Bob reaktiviert Hauptziel
         alice.position = Position(33, 12)
         alice.path = [Position(34, 12)]
 
         path_back = [Position(30, 11), Position(30, 12), Position(29, 12)]
         pathfinder.find_path.return_value = path_back
 
+        # Takt 5: Alice absorbiert Resume-Signal (Inbox-Delay)
+        await engine.process_tick()
+        # Takt 6: Alice rückt auf (34, 12) vor und erteilt Clearance an Bob
+        await engine.process_tick()
+        # Takt 7: Bob verarbeitet Clearance und reaktiviert West-Tor
         await engine.process_tick()
 
-        # Bob wurde in Tick 5 durch Alice' Clearance sofort entsperrt und neu bepfadet
         assert not bob.is_evasion_locked
         current_goal_name = getattr(bob.active_goal, "name", None)
         assert current_goal_name == "West-Tor"
         assert bob.path == path_back
 
-        # 6. Beide Agenten setzen ihre reguläre Bewegung fort
+        # 6. Beide Agenten setzen reguläre Bewegung fort
         await engine.process_tick()
 
         assert bob.position == Position(30, 11)
@@ -438,6 +452,7 @@ class TestDistanceConstraintsAndPreemption:
         )
 
         assert coop_goal.status == "paused"
+        assert alice.active_goal is not None
         assert alice.active_goal.name == "In Nische ausweichen"
         assert alice.active_goal.priority == ExecutionPriority.URGENT
 

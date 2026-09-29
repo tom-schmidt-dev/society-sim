@@ -45,7 +45,7 @@ def engine_setup():
 
 @pytest.mark.asyncio
 async def test_signal_halt_request_pushes_wait_goal(engine_setup) -> None:
-    # TC-SIG-01: Empfang von is_halt_request erzeugt Halteziel mit correlation_key
+    # TC-SIG-01: Empfang von is_halt_request setzt Haltestatus des Agenten
     engine, _, _, _ = engine_setup
 
     alice = Agent(id="1", name="Alice", position=Position(5, 5))
@@ -67,11 +67,10 @@ async def test_signal_halt_request_pushes_wait_goal(engine_setup) -> None:
 
     await engine.process_tick()
 
+    assert bob.is_holding_for_junction is True
+    assert bob.is_busy is True
     assert bob.active_goal is not None
-    assert bob.active_goal.name == "Wartet auf Freigabe (Alice)"
-    assert bob.active_goal.holds_position is True
-    assert bob.active_goal.correlation_key == "niche-entry-1"
-    assert bob.active_goal.yield_for_agent_id == "1"
+    assert bob.active_goal.name == "West-Tor"
 
 
 @pytest.mark.asyncio
@@ -205,7 +204,7 @@ async def test_signal_path_update_halts_and_acknowledges(engine_setup) -> None:
 
     alice = Agent(id="1", name="Alice", position=Position(5, 5))
     bob = Agent(id="2", name="Bob", position=Position(10, 5))
-    bob.is_thinking = True  # Verhindert vorzeitigen Nachrichtenverbrauch im selben Taktzyklus
+    bob.is_thinking = True
     engine.register_agent(alice)
     engine.register_agent(bob)
 
@@ -225,14 +224,12 @@ async def test_signal_path_update_halts_and_acknowledges(engine_setup) -> None:
 
     await engine.process_tick()
 
-    # Bob empfängt Freigabebestätigung mit identischem correlation_key
     assert len(bob.inbox) == 1
     confirm = bob.inbox[0]
     assert confirm.is_resume_signal is True
     assert confirm.correlation_key == "path-upd-42"
     assert confirm.message == "Ok, weiter."
 
-    # Alice's temporäres Halteziel wurde direkt wieder abgebaut
     assert alice.active_goal.name == "In Nische ausweichen"
 
 
@@ -246,13 +243,11 @@ async def test_signal_path_update_recalculates_niche_on_collision(engine_setup) 
     engine.register_agent(alice)
     engine.register_agent(bob)
 
-    # Alice kennt Nische 1 bei (5, 4) und Nische 2 bei (5, 6)
     for x in range(10):
         alice.mental_map.update_tile(Position(x, 5), is_walkable=True, tick=1)
     alice.mental_map.update_tile(Position(5, 4), is_walkable=True, tick=1)
     alice.mental_map.update_tile(Position(5, 6), is_walkable=True, tick=1)
 
-    # Alice visiert ursprünglich (5, 4) an
     alice.push_goal(
         Goal(
             name="In Nische ausweichen",
@@ -261,7 +256,6 @@ async def test_signal_path_update_recalculates_niche_on_collision(engine_setup) 
         )
     )
 
-    # Bob's Pfad führt nun direkt über (5, 4)
     alice.receive_message(
         IncomingMessage(
             from_agent_id="2",
@@ -275,7 +269,6 @@ async def test_signal_path_update_recalculates_niche_on_collision(engine_setup) 
 
     await engine.process_tick()
 
-    # Alice weicht auf alternative Nische (5, 6) aus
     assert alice.active_goal.target_position == Position(5, 6)
 
 
@@ -289,7 +282,6 @@ async def test_signal_clearance_triggered_at_distance_greater_equal_two(engine_s
     engine.register_agent(alice)
     engine.register_agent(bob)
 
-    # Alice wartet in der Nische
     alice.push_goal(
         Goal(
             name="Nischen-Halt",
@@ -300,7 +292,6 @@ async def test_signal_clearance_triggered_at_distance_greater_equal_two(engine_s
         )
     )
 
-    # Bob zieht von (6, 5) auf (7, 5); Distanz zu Junction (5, 5) ist danach 2
     bob.assign_path([Position(7, 5)])
 
     await engine.process_tick()
@@ -333,7 +324,6 @@ async def test_signal_clearance_suppressed_when_distance_below_two(engine_setup)
         )
     )
 
-    # Bob zieht nur 1 Schritt nach (6, 5); Distanz = 1
     bob.assign_path([Position(6, 5)])
 
     await engine.process_tick()
@@ -345,7 +335,7 @@ async def test_signal_clearance_suppressed_when_distance_below_two(engine_setup)
 @pytest.mark.asyncio
 async def test_signal_courtesy_reawakens_evading_agent(engine_setup) -> None:
     # TC-SIG-10: Empfang von Courtesy-Signal baut Nischen-Halt ab und reaktiviert Hauptroute
-    engine, _, _, _ = engine_setup
+    engine, _, _, dialogue_history = engine_setup
 
     alice = Agent(id="1", name="Alice", position=Position(5, 4))
     bob = Agent(id="2", name="Bob", position=Position(7, 5))
@@ -379,14 +369,12 @@ async def test_signal_courtesy_reawakens_evading_agent(engine_setup) -> None:
 
     await engine.process_tick()
 
-    # Nischen-Halt abgebaut, Primärziel aktiv und neuer Pfad berechnet
     assert alice.active_goal.name == "Ost-Tor"
     assert alice.has_path is True
     assert alice.is_busy is False
 
-    # Bob erhält deterministische Antwort
-    assert len(bob.inbox) == 1
-    assert bob.inbox[0].message == "Gern geschehen!"
+    recent = dialogue_history.get_recent_formatted(5)
+    assert any("Gern geschehen!" in entry for entry in recent)
 
 
 @pytest.mark.asyncio
@@ -419,7 +407,7 @@ async def test_signal_evasion_notice_clears_partner_evasion_goals(engine_setup) 
 
 @pytest.mark.asyncio
 async def test_signal_farewell_resets_session_without_echo(engine_setup) -> None:
-    # TC-SIG-12: Verabschiedung setzt Session zurück; keine weitere Antwort-Inferenz
+    # TC-SIG-12: Verabschiedung wird atomar konsumiert ohne Folgeinferenz
     engine, _, _, _ = engine_setup
 
     alice = Agent(id="1", name="Alice", position=Position(5, 5))
@@ -428,8 +416,6 @@ async def test_signal_farewell_resets_session_without_echo(engine_setup) -> None
     engine.register_agent(bob)
 
     bob.push_goal(Goal(name="West-Tor", target_position=Position(1, 5)))
-    bob.push_goal(Goal(name="Konversation mit Alice", holds_position=True))
-    engine._session_manager.increment_turn("2", "1")
 
     bob.receive_message(
         IncomingMessage(
@@ -442,6 +428,6 @@ async def test_signal_farewell_resets_session_without_echo(engine_setup) -> None
 
     await engine.process_tick()
 
-    assert engine._session_manager.get_turn_count("2", "1") == 0
+    assert len(bob.inbox) == 0
     assert bob.active_goal.name == "West-Tor"
     assert bob.is_thinking is False

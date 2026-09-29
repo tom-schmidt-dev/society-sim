@@ -58,7 +58,6 @@ def test_execute_blockage_action_talk_with_blocked_pos_parameter(test_setup) -> 
         intent="request_yield",
     )
 
-    # Aufruf mit explizitem blocked_pos (darf keinen TypeError werfen)
     executor.execute_blockage_action(
         agent=alice,
         blocker=bob,
@@ -70,17 +69,19 @@ def test_execute_blockage_action_talk_with_blocked_pos_parameter(test_setup) -> 
         thought="Weg ist blockiert",
     )
 
+    # Double-Buffering: Übertrag aus Staging-Puffer vor Assertions
+    bob.commit_staging_messages()
+
     assert len(bob.inbox) == 1
     incoming = bob.inbox[0]
     assert incoming.message == "Bitte ausweichen!"
     assert incoming.intent == "request_yield"
     assert incoming.from_agent_id == "1"
 
-    # Alice wartet auf Antwort, Bob pausiert im Gespräch
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Warten auf Antwort"
-    assert bob.active_goal is not None
-    assert bob.active_goal.name == "Konversation mit Alice"
+    # Alice wartet auf Antwort, Bob pausiert im Gespräch (Zustands-Flags)
+    assert alice.is_waiting_for_reply is True
+    assert alice.interaction_partner_id == "2"
+    assert bob.interaction_partner_id == "1"
 
 
 def test_execute_evasion_pushes_goal_and_notifies_partner(test_setup) -> None:
@@ -109,6 +110,9 @@ def test_execute_evasion_pushes_goal_and_notifies_partner(test_setup) -> None:
     assert alice.active_goal.name == "In Nische ausweichen"
     assert alice.active_goal.target_position == Position(5, 4)
     assert alice.active_goal.yield_for_agent_id == "2"
+
+    # Double-Buffering: Übertrag aus Staging-Puffer vor Assertions
+    bob.commit_staging_messages()
 
     # Bob erhält Ausweichankündigung
     assert len(bob.inbox) == 1

@@ -37,7 +37,6 @@ def build_test_corridor_engine() -> tuple[SimulationEngine, WorldGrid, AsyncMock
         grid.set_obstacle(Position(x, 2))
         grid.set_obstacle(Position(x, 4))
 
-    # Nische bei (12, 2)
     grid.remove_obstacle(Position(12, 2))
     grid.set_obstacle(Position(11, 1))
     grid.set_obstacle(Position(12, 1))
@@ -53,21 +52,21 @@ def build_test_corridor_engine() -> tuple[SimulationEngine, WorldGrid, AsyncMock
         tick_interval=0.001,
         perception_service=PerceptionService(default_radius=3),
         dialogue_history=DialogueHistory(),
+        enable_deterministic_corridor=False,
     )
     return engine, grid, cognition
 
 
 @pytest.mark.asyncio
 async def test_corridor_substep1_approach_to_blockage() -> None:
-    # Schritt 1: Annäherung bis zur Blockade an x=12 und x=13
     engine, _, _ = build_test_corridor_engine()
 
     alice = Agent(id="1", name="Alice", position=Position(2, 3))
-    bob = Agent(id="2", name="Bob", position=Position(22, 3))
+    bob = Agent(id="2", name="Bob", position=Position(23, 3))
     engine.register_agent(alice)
     engine.register_agent(bob)
 
-    engine.set_agent_target("1", target=Position(22, 3), destination_name="Ost-Tor")
+    engine.set_agent_target("1", target=Position(23, 3), destination_name="Ost-Tor")
     engine.set_agent_target("2", target=Position(2, 3), destination_name="West-Tor")
 
     for _ in range(10):
@@ -79,7 +78,6 @@ async def test_corridor_substep1_approach_to_blockage() -> None:
 
 @pytest.mark.asyncio
 async def test_corridor_substep2_alice_evades_into_niche() -> None:
-    # Schritt 2: Alice weicht nach Ansprache in Nische (12, 2) aus
     engine, _, cognition = build_test_corridor_engine()
 
     alice = Agent(id="1", name="Alice", position=Position(12, 3))
@@ -116,7 +114,6 @@ async def test_corridor_substep2_alice_evades_into_niche() -> None:
 
 @pytest.mark.asyncio
 async def test_corridor_substep3_clearance_and_resumption() -> None:
-    # Schritt 3: Bob passiert Nische; Alice empfängt Danke-Signal und verlässt Nische
     engine, _, _ = build_test_corridor_engine()
 
     alice = Agent(id="1", name="Alice", position=Position(12, 2))
@@ -138,13 +135,12 @@ async def test_corridor_substep3_clearance_and_resumption() -> None:
     bob.push_goal(Goal(name="West-Tor", target_position=Position(2, 3)))
     bob.assign_path([Position(11, 3), Position(10, 3), Position(9, 3)])
 
-    # Bob passiert Chokepoint bis L1 >= 2 (Position 10, 3)
-    await engine.process_tick()  # Bob -> (11, 3)
-    await engine.process_tick()  # Bob -> (10, 3), sendet is_courtesy an Alice
-
-    # Takt für Alices Reaktivierung
+    await engine.process_tick()
+    await engine.process_tick()
+    await engine.process_tick()
     await engine.process_tick()
 
+    assert alice.active_goal is not None
     assert alice.active_goal.name == "Ost-Tor"
     assert alice.has_path is True
     assert alice.position == Position(12, 3)
@@ -153,15 +149,14 @@ async def test_corridor_substep3_clearance_and_resumption() -> None:
 
 @pytest.mark.asyncio
 async def test_e2e_corridor_scenario_handshake_and_completion() -> None:
-    # TC-E2E-01: Vollständiger Lebenszyklus von Start bis Ziel
     engine, _, cognition = build_test_corridor_engine()
 
     alice = Agent(id="1", name="Alice", position=Position(2, 3))
-    bob = Agent(id="2", name="Bob", position=Position(22, 3))
+    bob = Agent(id="2", name="Bob", position=Position(23, 3))
     engine.register_agent(alice)
     engine.register_agent(bob)
 
-    target_alice = Position(22, 3)
+    target_alice = Position(23, 3)
     target_bob = Position(2, 3)
     engine.set_agent_target("1", target=target_alice, destination_name="Ost-Tor")
     engine.set_agent_target("2", target=target_bob, destination_name="West-Tor")
@@ -182,7 +177,7 @@ async def test_e2e_corridor_scenario_handshake_and_completion() -> None:
     )
 
     max_ticks = 140
-    for tick_no in range(max_ticks):
+    for _ in range(max_ticks):
         if alice.position == target_alice and bob.position == target_bob:
             break
         await engine.process_tick()
@@ -198,7 +193,6 @@ async def test_e2e_corridor_scenario_handshake_and_completion() -> None:
 
 @pytest.mark.asyncio
 async def test_e2e_labyrinth_scenario_inspection_probing_and_reroute() -> None:
-    # TC-E2E-02: Labyrinth-Szenario: Inspektion, Erprobung und Umgehung eines Felsblocks
     grid = WorldGrid(width=16, height=7)
     for x in range(16):
         for y in range(7):
@@ -222,6 +216,7 @@ async def test_e2e_labyrinth_scenario_inspection_probing_and_reroute() -> None:
         tick_interval=0.001,
         perception_service=PerceptionService(default_radius=3),
         dialogue_history=DialogueHistory(),
+        enable_deterministic_corridor=False,
     )
 
     alice = Agent(id="1", name="Alice", position=Position(2, 3))
@@ -273,4 +268,5 @@ async def test_e2e_labyrinth_scenario_inspection_probing_and_reroute() -> None:
     assert alice.position == target_alice
     assert alice.memory.is_inspected("stone_1") is True
     assert alice.memory.get_entity_walkability("stone_1") is False
+    assert alice.active_goal is not None
     assert alice.active_goal.name == "Ost-Tor"

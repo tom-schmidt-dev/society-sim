@@ -39,10 +39,6 @@ from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
 
 
-# ============================================================================
-# Fixtures und Test-Fabriken
-# ============================================================================
-
 @pytest.fixture
 def mock_logger() -> MagicMock:
     logger = MagicMock(spec=IEventLogger)
@@ -90,7 +86,6 @@ def create_agent(
     energy: int = 100,
     grid_size: tuple[int, int] = (20, 20),
 ) -> Agent:
-    """Erzeugt eine standardisierte Agent-Instanz mit initialisierter MentalMap."""
     agent = Agent(id=agent_id, name=name, position=pos, energy=energy)
     agent.mental_map.set_bounds(grid_size[0], grid_size[1])
     return agent
@@ -104,22 +99,14 @@ def create_entity(
     is_passable: bool = False,
     entity_type: str = "chest",
 ) -> WorldEntity:
-    """Erzeugt eine standardisierte WorldEntity-Instanz für Interaktionsprüfungen."""
     entity = WorldEntity(id=entity_id, name=name, position=pos, is_conversational=is_conversational)
-    entity.is_passable = is_passable  # type: ignore[attr-defined]
+    entity.is_passable = is_passable
     entity.entity_type = entity_type
     return entity
 
 
-# ============================================================================
-# 1. Tests: CriticalSectionCoordinator (Unit-Tests)
-# ============================================================================
-
 class TestCriticalSectionCoordinator:
-    """Testet die Kernfunktionalität des CriticalSectionCoordinators isoliert."""
-
     def test_acquire_initial_success(self, mock_logger: MagicMock) -> None:
-        """Der erste anfordernde Agent erhält sofortigen Zugriff auf die Ressource."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 1)
         agent = create_agent("agent_1", "Alice", Position(0, 0))
 
@@ -134,7 +121,6 @@ class TestCriticalSectionCoordinator:
         assert coordinator.get_holder("target:(5,5)") == agent.id
 
     def test_acquire_idempotent_for_current_holder(self, mock_logger: MagicMock) -> None:
-        """Wiederholtes Anfordern durch den aktuellen Inhaber blockiert nicht."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 1)
         agent = create_agent("agent_1", "Alice", Position(0, 0))
 
@@ -142,7 +128,6 @@ class TestCriticalSectionCoordinator:
         assert coordinator.acquire_or_queue(agent, "res:1", ExecutionPriority.ROUTINE) is True
 
     def test_priority_queueing_three_agents(self, mock_logger: MagicMock) -> None:
-        """Agenten werden strikt nach Priorität eingereiht: URGENT vor COOPERATIVE vor ROUTINE."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 1)
         agent_holder = create_agent("agent_holder", "Holder", Position(0, 0))
         agent_routine = create_agent("agent_routine", "Routine", Position(1, 0))
@@ -151,7 +136,6 @@ class TestCriticalSectionCoordinator:
 
         coordinator.acquire_or_queue(agent_holder, "chokepoint", ExecutionPriority.ROUTINE)
 
-        # Einreihen in suboptimaler Reihenfolge
         assert coordinator.acquire_or_queue(agent_routine, "chokepoint", ExecutionPriority.ROUTINE) is False
         assert coordinator.acquire_or_queue(agent_urgent, "chokepoint", ExecutionPriority.URGENT) is False
         assert coordinator.acquire_or_queue(agent_coop, "chokepoint", ExecutionPriority.COOPERATIVE) is False
@@ -159,11 +143,9 @@ class TestCriticalSectionCoordinator:
         section = coordinator.get_or_create_section("chokepoint")
         queued_ids = [req.agent_id for req in section.wait_queue]
 
-        # Erwartete Sortierung: URGENT (agent_urgent) -> COOPERATIVE (agent_coop) -> ROUTINE (agent_routine)
         assert queued_ids == ["agent_urgent", "agent_coop", "agent_routine"]
 
     def test_proposed_order_tie_breaker(self, mock_logger: MagicMock) -> None:
-        """Bei gleicher Priorität entscheidet die vorgeschlagene LLM-Reihenfolge (proposed_order)."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 1)
         agent_holder = create_agent("holder", "Holder", Position(0, 0))
         agent_a = create_agent("agent_a", "Alice", Position(1, 0))
@@ -171,7 +153,6 @@ class TestCriticalSectionCoordinator:
 
         coordinator.acquire_or_queue(agent_holder, "res:target", ExecutionPriority.ROUTINE)
 
-        # Beide COOPERATIVE, aber Bob hat niedrigere Rangnummer (Rang 1 vor Rang 2)
         coordinator.acquire_or_queue(agent_a, "res:target", ExecutionPriority.COOPERATIVE, proposed_order=2)
         coordinator.acquire_or_queue(agent_b, "res:target", ExecutionPriority.COOPERATIVE, proposed_order=1)
 
@@ -180,7 +161,6 @@ class TestCriticalSectionCoordinator:
         assert section.wait_queue[1].agent_id == "agent_a"
 
     def test_fifo_fallback_on_identical_priority_and_order(self, mock_logger: MagicMock) -> None:
-        """Bei identischer Priorität und fehlendem proposed_order entscheidet der Ankunfts-Tick (FIFO)."""
         current_tick = 1
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: current_tick)
         agent_holder = create_agent("holder", "Holder", Position(0, 0))
@@ -199,7 +179,6 @@ class TestCriticalSectionCoordinator:
         assert section.wait_queue[1].agent_id == "agent_2"
 
     def test_release_transfers_to_next_in_queue(self, mock_logger: MagicMock) -> None:
-        """Freigabe übergibt die Ressource an den nächsten wartenden Agenten."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 1)
         agent_1 = create_agent("agent_1", "A1", Position(0, 0))
         agent_2 = create_agent("agent_2", "A2", Position(1, 0))
@@ -214,7 +193,6 @@ class TestCriticalSectionCoordinator:
         assert coordinator.is_holder("terminal", "agent_2") is True
 
     def test_release_with_mark_completed(self, mock_logger: MagicMock) -> None:
-        """Freigabe mit mark_completed persistiert den Status und den Abschluss-Tick."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 42)
         agent = create_agent("agent_1", "A1", Position(0, 0))
 
@@ -228,7 +206,6 @@ class TestCriticalSectionCoordinator:
         assert section.completed_tick == 42
 
     def test_unauthorized_release_is_rejected(self, mock_logger: MagicMock) -> None:
-        """Ein unberechtigter Agent kann eine fremde Critical Section nicht freigeben."""
         coordinator = CriticalSectionCoordinator(logger=mock_logger, tick_provider=lambda: 1)
         holder = create_agent("holder", "Holder", Position(0, 0))
         intruder = create_agent("intruder", "Intruder", Position(1, 0))
@@ -241,15 +218,8 @@ class TestCriticalSectionCoordinator:
         assert coordinator.is_completed("key") is False
 
 
-# ============================================================================
-# 2. Tests: GoalService & Notwendigkeitsprüfung
-# ============================================================================
-
 class TestGoalServiceCriticalSections:
-    """Testet Zielpausierung, Reaktivierung und Notwendigkeitsprüfung im GoalService."""
-
     def test_validate_goal_necessity_when_not_completed(self, mock_logger: MagicMock, mock_pathfinder: MagicMock, mock_cognition: MagicMock) -> None:
-        """Ist das Ziel noch nicht abgeschlossen, bleibt es aktiv erhalten."""
         service = GoalService(mock_logger, mock_cognition, mock_pathfinder)
         agent = create_agent("agent_1", "A1", Position(0, 0))
         goal = Goal(name="Hebel umlegen", target_position=Position(5, 5))
@@ -261,7 +231,6 @@ class TestGoalServiceCriticalSections:
         assert agent.active_goal == goal
 
     def test_validate_goal_necessity_when_already_completed(self, mock_logger: MagicMock, mock_pathfinder: MagicMock, mock_cognition: MagicMock) -> None:
-        """Ist das Ziel bereits erledigt, wird es verworfen und der Pfad gelöscht."""
         service = GoalService(mock_logger, mock_cognition, mock_pathfinder)
         agent = create_agent("agent_1", "A1", Position(0, 0))
         goal = Goal(name="Hebel umlegen", target_position=Position(5, 5))
@@ -273,12 +242,10 @@ class TestGoalServiceCriticalSections:
         assert is_needed is False
         assert agent.active_goal is None
         assert agent.has_path is False
-        # Prüfen, ob das Event geloggt wurde
         logged_types = [call_args[0][0].event_type for call_args in mock_logger.log.call_args_list]
         assert "goal_deemed_unnecessary" in logged_types
 
     def test_pause_and_resume_goal(self, mock_logger: MagicMock, mock_pathfinder: MagicMock, mock_cognition: MagicMock) -> None:
-        """Ziele können pausiert und exakt in den Zustand 'active' reaktiviert werden."""
         service = GoalService(mock_logger, mock_cognition, mock_pathfinder)
         agent = create_agent("agent_1", "A1", Position(0, 0))
         routine_goal = Goal(name="Erkunde", priority=ExecutionPriority.ROUTINE)
@@ -291,22 +258,16 @@ class TestGoalServiceCriticalSections:
         resumed = service.resume_goal(agent)
         assert resumed is not None
         assert resumed.status == "active"
+        assert agent.active_goal is not None
         assert agent.active_goal.status == "active"
 
 
-# ============================================================================
-# 3. Tests: ActionExecutor & Kritische Bereiche
-# ============================================================================
-
 class TestActionExecutorCriticalSections:
-    """Testet den wechselseitigen Ausschluss bei atomaren Aktionen wie Inspektion und Probe."""
-
     def test_execute_inspection_competition_between_two_agents(
         self,
         mock_logger: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """Greifen zwei Agenten auf dieselbe Entität zu, wird der zweite pausiert."""
         grid = WorldGrid(width=10, height=10)
         history = DialogueHistory()
         goal_service = GoalService(mock_logger, MagicMock(), mock_pathfinder)
@@ -329,12 +290,9 @@ class TestActionExecutorCriticalSections:
         goal_service.push_goal(agent_1, goal_1)
         goal_service.push_goal(agent_2, goal_2)
 
-        # Agent 1 führt Inspektion durch -> erlangt Lock, schließt ab, markiert completed
         executor.execute_inspection(agent_1, target_entity, "inc-1", current_tick=1)
         assert coordinator.is_completed("entity:box_1") is True
 
-        # Wenn Agent 2 danach versucht, dieselbe Kiste zu sperren
-        # Simuliere Lock-Konkurrenz: Lock wird von Agent 1 während der Ausführung noch gehalten
         coordinator_busy = CriticalSectionCoordinator(logger=mock_logger)
         coordinator_busy.acquire_or_queue(agent_1, "entity:box_1", ExecutionPriority.ROUTINE)
 
@@ -348,7 +306,7 @@ class TestActionExecutorCriticalSections:
         )
 
         executor_busy.execute_inspection(agent_2, target_entity, "inc-2", current_tick=2)
-        # Agent 2 konnte den Lock nicht erhalten -> sein Ziel wurde pausiert
+        assert agent_2.active_goal is not None
         assert agent_2.active_goal.status == "paused"
 
     def test_execute_probe_critical_section(
@@ -356,7 +314,6 @@ class TestActionExecutorCriticalSections:
         mock_logger: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """Physische Erprobung (Probe) erfordert exklusiven Zugriff und gibt nach Erfolg frei."""
         grid = WorldGrid(width=10, height=10)
         history = DialogueHistory()
         goal_service = GoalService(mock_logger, MagicMock(), mock_pathfinder)
@@ -383,20 +340,13 @@ class TestActionExecutorCriticalSections:
         assert agent.memory.get_entity_walkability("wall_1") is False
 
 
-# ============================================================================
-# 4. Tests: LLM-Fehlerszenarien & Resilienz
-# ============================================================================
-
 class TestLLMErrorHandlingAndEdgeCases:
-    """Testet Ausnahmezustände, leere Rückgaben und Fehlformatierungen der Kognition."""
-
     @pytest.mark.asyncio
     async def test_resolve_blockage_cognition_timeout_exception(
         self,
         mock_logger: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """Bei Timeout/Exception des LLMs verfällt der Agent nicht in Dauer-Thinking."""
         cognition = MagicMock(spec=ICognitionProvider)
         cognition.resolve_blockage = AsyncMock(side_effect=TimeoutError("LLM Inferenz überschritten"))
 
@@ -419,6 +369,7 @@ class TestLLMErrorHandlingAndEdgeCases:
             action_executor=executor,
             session_manager=session_mgr,
             dialogue_history=history,
+            enable_deterministic_corridor=False,
         )
 
         agent = create_agent("agent_1", "Alice", Position(1, 1))
@@ -439,7 +390,6 @@ class TestLLMErrorHandlingAndEdgeCases:
         mock_logger: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """Laufzeitfehler im Dialog-LLM loggen 'dialogue_failed' und setzen den Zustand zurück."""
         cognition = MagicMock(spec=ICognitionProvider)
         cognition.respond_to_dialogue = AsyncMock(side_effect=RuntimeError("Syntaxfehler im JSON"))
 
@@ -477,11 +427,10 @@ class TestLLMErrorHandlingAndEdgeCases:
 
     @pytest.mark.asyncio
     async def test_empty_or_faulty_action_target_sanitization(
-            self,
-            mock_logger: MagicMock,
-            mock_pathfinder: MagicMock,
+        self,
+        mock_logger: MagicMock,
+        mock_pathfinder: MagicMock,
     ) -> None:
-        """Gibt das LLM fälschlicherweise die eigene ID als Talk-Target zurück, wird auf Blocker korrigiert."""
         cognition = MagicMock(spec=ICognitionProvider)
         cognition.resolve_blockage = AsyncMock(
             return_value=BlockedResolution(
@@ -514,6 +463,7 @@ class TestLLMErrorHandlingAndEdgeCases:
             action_executor=executor,
             session_manager=session_mgr,
             dialogue_history=history,
+            enable_deterministic_corridor=False,
         )
 
         agent = create_agent("agent_1", "Alice", Position(1, 1))
@@ -522,18 +472,13 @@ class TestLLMErrorHandlingAndEdgeCases:
 
         await coordinator.resolve_blockage(agent, blocker, Position(1, 2), [agent, blocker])
 
+        blocker.commit_staging_messages()
         assert len(blocker.inbox) == 1
         assert blocker.inbox[0].from_agent_id == "agent_1"
         assert blocker.inbox[0].message == "Selbstgespräch"
 
 
-# ============================================================================
-# 5. Tests: Multi-Agenten-Szenarien (>= 3 Agenten) & End-to-End
-# ============================================================================
-
 class TestMultiAgentCriticalSectionScenarios:
-    """Testet komplexe Konstellationen mit drei oder mehr Agenten im Simulationsablauf."""
-
     @pytest.mark.asyncio
     async def test_three_agents_competing_for_same_goal_necessity_abort(
         self,
@@ -541,15 +486,10 @@ class TestMultiAgentCriticalSectionScenarios:
         mock_presenter: MagicMock,
         mock_cognition: MagicMock,
     ) -> None:
-        """Drei Agenten wollen dasselbe Ziel bearbeiten.
-
-        Agent 1 schließt es ab. Agent 2 und 3 brechen nach Notwendigkeitsprüfung deterministisch ab.
-        """
         grid = WorldGrid(width=10, height=10)
         pathfinder = MagicMock(spec=IPathfinder)
         target_pos = Position(5, 5)
 
-        # Deterministische Pfade für alle Agenten
         pathfinder.find_path = MagicMock(return_value=[Position(5, 5)])
 
         engine = SimulationEngine(
@@ -570,12 +510,10 @@ class TestMultiAgentCriticalSectionScenarios:
 
         resource_key = f"pos:{target_pos.x},{target_pos.y}"
 
-        # Agent 1 belegt die Critical Section
         assert engine.critical_section_coordinator.acquire_or_queue(
             agent_1, resource_key, ExecutionPriority.ROUTINE
         ) is True
 
-        # Agent 2 und 3 reihen sich ein und werden pausiert
         assert engine.critical_section_coordinator.acquire_or_queue(
             agent_2, resource_key, ExecutionPriority.ROUTINE, proposed_order=1
         ) is False
@@ -583,30 +521,24 @@ class TestMultiAgentCriticalSectionScenarios:
             agent_3, resource_key, ExecutionPriority.ROUTINE, proposed_order=2
         ) is False
 
-        # Ziele vergeben
         engine.set_agent_target(agent_1.id, target_pos, "Schatz heben")
         engine.set_agent_target(agent_2.id, target_pos, "Schatz heben")
         engine.set_agent_target(agent_3.id, target_pos, "Schatz heben")
 
-        # Agent 2 und 3 wurden pausiert, da sie in der Warteschlange stehen
         engine._goal_service.pause_goal(agent_2)
         engine._goal_service.pause_goal(agent_3)
 
+        assert agent_2.active_goal is not None
         assert agent_2.active_goal.status == "paused"
+        assert agent_3.active_goal is not None
         assert agent_3.active_goal.status == "paused"
 
-        # Agent 1 betritt das Zielfeld
         agent_1.position = target_pos
 
-        # Tick ausführen: Agent 1 schließt Ziel ab und löst Freigabe + Notifikation aus
         await engine.process_tick()
 
-        # Überprüfen: Agent 1 hat das Ziel abgeschlossen
         assert agent_1.active_goal is None
         assert engine.critical_section_coordinator.is_completed(resource_key) is True
-
-        # Durch die Freigabe wurde Agent 2 als nächster Inhaber notifiziert.
-        # Dessen Notwendigkeitsprüfung ergab: is_completed == True -> Ziel wurde verworfen!
         assert agent_2.active_goal is None
 
     @pytest.mark.asyncio
@@ -617,7 +549,6 @@ class TestMultiAgentCriticalSectionScenarios:
         mock_cognition: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """Ein dringendes Ausweichziel (URGENT) überholt reguläre Routine-Ziele in der Warteschlange."""
         grid = WorldGrid(width=10, height=10)
         engine = SimulationEngine(
             grid=grid,
@@ -639,23 +570,16 @@ class TestMultiAgentCriticalSectionScenarios:
 
         chokepoint = "chokepoint_pos:(3,3)"
 
-        # Holder besetzt die Ressource
         engine.critical_section_coordinator.acquire_or_queue(agent_holder, chokepoint, ExecutionPriority.ROUTINE)
-
-        # Routine 1 und 2 fordern an
         engine.critical_section_coordinator.acquire_or_queue(agent_routine_1, chokepoint, ExecutionPriority.ROUTINE)
         engine.critical_section_coordinator.acquire_or_queue(agent_routine_2, chokepoint, ExecutionPriority.ROUTINE)
-
-        # Jetzt fordert ein Agent mit Notfall-/Ausweichpriorität an
         engine.critical_section_coordinator.acquire_or_queue(agent_urgent, chokepoint, ExecutionPriority.URGENT)
 
-        # Warteschlange prüfen: Der Urgent-Agent muss an erster Stelle stehen
         section = engine.critical_section_coordinator.get_or_create_section(chokepoint)
         assert section.wait_queue[0].agent_id == "urg"
         assert section.wait_queue[1].agent_id == "r1"
         assert section.wait_queue[2].agent_id == "r2"
 
-        # Freigabe durch Holder: Der Urgent-Agent muss die Ressource erhalten
         promoted = engine.critical_section_coordinator.release(agent_holder.id, chokepoint)
         assert promoted == "urg"
         assert engine.critical_section_coordinator.is_holder(chokepoint, "urg") is True
@@ -668,7 +592,6 @@ class TestMultiAgentCriticalSectionScenarios:
         mock_cognition: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """In der interaction_queue wartende Agenten werden korrekt dequeued und lösen Kognition aus."""
         grid = WorldGrid(width=10, height=10)
         engine = SimulationEngine(
             grid=grid,
@@ -684,10 +607,8 @@ class TestMultiAgentCriticalSectionScenarios:
         engine.register_agent(agent_target)
         engine.register_agent(agent_requester)
 
-        # Requester plant Bewegung auf das Feld von Target
         agent_requester.path = [Position(2, 2)]
 
-        # Requester in Warteschlange einhängen
         agent_target.interaction_queue.append(
             InteractionRequest(
                 requester_id=agent_requester.id,
@@ -697,10 +618,8 @@ class TestMultiAgentCriticalSectionScenarios:
             )
         )
 
-        # Tick abarbeiten: Dequeue-Bedingungen sind erfüllt (in Hörweite, Position stimmt noch)
         await engine.process_tick()
 
-        # Überprüfen, ob die Dequeue-Abarbeitung stattfand
         logged_events = [call_args[0][0].event_type for call_args in mock_logger.log.call_args_list]
         assert "interaction_dequeued" in logged_events
         assert len(agent_target.interaction_queue) == 0
@@ -713,7 +632,6 @@ class TestMultiAgentCriticalSectionScenarios:
         mock_cognition: MagicMock,
         mock_pathfinder: MagicMock,
     ) -> None:
-        """Hat sich die Situation verändert (z. B. Requester ging weg), wird der Request verworfen."""
         grid = WorldGrid(width=10, height=10)
         engine = SimulationEngine(
             grid=grid,
@@ -724,7 +642,7 @@ class TestMultiAgentCriticalSectionScenarios:
         )
 
         agent_target = create_agent("target", "TargetAgent", Position(2, 2))
-        agent_requester = create_agent("req", "RequesterAgent", Position(8, 8))  # Außer Hörweite
+        agent_requester = create_agent("req", "RequesterAgent", Position(8, 8))
 
         engine.register_agent(agent_target)
         engine.register_agent(agent_requester)

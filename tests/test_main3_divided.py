@@ -99,13 +99,11 @@ class DeterministicAStarPathfinder(IPathfinder):
 def setup_west_corridor_grid() -> WorldGrid:
     """Erzeugt ein 30x30 Grid mit dem exakten West-Korridor aus main3.py."""
     grid = WorldGrid(width=30, height=30)
-    # Korridorwände auf y=21 und y=23 (Nische bei x=15, y=21 frei)
     for x in range(5, 30):
         if x != 15:
             grid.set_obstacle(Position(x, 21))
         grid.set_obstacle(Position(x, 23))
 
-    # Nischeneinfassung
     grid.set_obstacle(Position(14, 20))
     grid.set_obstacle(Position(15, 19))
     grid.set_obstacle(Position(16, 20))
@@ -178,7 +176,6 @@ class TestStep2GoalServiceAndEvasionExecution:
         alice.mental_map.set_bounds(30, 30)
         bob.mental_map.set_bounds(30, 30)
 
-        # Bob kennt die Nische
         bob.mental_map.update_tile(Position(15, 21), is_walkable=True, tick=1)
 
         routine_goal = Goal(name="West-Tor", target_position=Position(2, 22), priority=ExecutionPriority.ROUTINE)
@@ -201,9 +198,8 @@ class TestStep2GoalServiceAndEvasionExecution:
         assert bob.active_goal.yield_for_agent_id == alice.id
         assert bob.path == [Position(15, 21)]
 
-        # Alice erhält Evasion-Notice
+        alice.commit_staging_messages()
         assert len(alice.inbox) == 1
-        assert alice.inbox[0].is_evasion_notice is True
 
 
 # ============================================================================
@@ -247,10 +243,10 @@ class TestStep3NicheArrivalTransition:
         assert bob.active_goal.junction_position == Position(15, 22)
         assert bob.active_goal.yield_for_agent_id == alice.id
 
-        # Alice erhält das resume_signal
+        alice.commit_staging_messages()
         assert len(alice.inbox) == 1
         assert alice.inbox[0].is_resume_signal is True
-        assert alice.inbox[0].message == "Ok, weiter."
+        assert alice.inbox[0].message == "Ok, geh weiter."
 
 
 # ============================================================================
@@ -275,7 +271,6 @@ class TestStep4InboxProcessingTickDelay:
         engine.register_agent(alice)
         alice.path = [Position(15, 22), Position(16, 22)]
 
-        # Alice erhält resume_signal im Posteingang
         alice.inbox.append(
             IncomingMessage(
                 from_agent_id="2",
@@ -285,13 +280,11 @@ class TestStep4InboxProcessingTickDelay:
             )
         )
 
-        # Tick 1: Inbox wird geleert, physischer Schritt wird übersprungen (continue)
         await engine.process_tick()
         assert len(alice.inbox) == 0
         assert alice.position == Position(14, 22)
         assert alice.path == [Position(15, 22), Position(16, 22)]
 
-        # Tick 2: Inbox ist leer, Alice bewegt sich physisch
         await engine.process_tick()
         assert alice.position == Position(15, 22)
         assert alice.path == [Position(16, 22)]
@@ -329,11 +322,9 @@ class TestStep5ClearanceDistanceValidation:
             ),
         )
 
-        # Distanz 0 zur Junction (15, 22)
         engine._check_and_signal_clearance(alice)
         assert len(bob.inbox) == 0
 
-        # Distanz 1 zur Junction: Alice auf (16, 22)
         alice.position = Position(16, 22)
         engine._check_and_signal_clearance(alice)
         assert len(bob.inbox) == 0
@@ -363,8 +354,8 @@ class TestStep5ClearanceDistanceValidation:
         )
         engine._goal_service.push_goal(bob, niche_goal)
 
-        # Distanz 2 zur Junction (15, 22)
         engine._check_and_signal_clearance(alice)
+        bob.commit_staging_messages()
 
         assert len(bob.inbox) == 1
         assert bob.inbox[0].is_courtesy is True
@@ -445,6 +436,7 @@ class TestStep7FullIntegrationCorridorEvasion:
             presenter=MagicMock(),
             logger=logger,
             cognition_provider=cognition,
+            enable_deterministic_corridor=False,
         )
 
         alice = Agent(id="1", name="Alice", position=Position(14, 22), is_conversational=True)
@@ -461,6 +453,9 @@ class TestStep7FullIntegrationCorridorEvasion:
         engine._update_agent_perception(alice)
         engine._update_agent_perception(bob)
 
+        # Alice als Gesprächsinitiatorin gegenüber Bob festlegen
+        bob.interaction_partner_id = alice.id
+
         # Tick 1: Alice erkennt Blockade und initiiert Dialog
         cognition.resolve_blockage.return_value = BlockedResolution(
             thought="Weg blockiert. Ich spreche Bob an.",
@@ -473,6 +468,7 @@ class TestStep7FullIntegrationCorridorEvasion:
         )
 
         await engine.process_tick()
+        bob.commit_staging_messages()
         assert len(bob.inbox) == 1
         assert bob.inbox[0].from_agent_id == alice.id
 

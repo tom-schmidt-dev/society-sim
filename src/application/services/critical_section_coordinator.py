@@ -179,3 +179,8 @@ class CriticalSectionCoordinator:
     def is_holder(self, resource_key: str, agent_id: str) -> bool:
         section = self._sections.get(resource_key)
         return bool(section and section.holder_agent_id == agent_id)
+
+    def get_holder(self, resource_key: str) -> Optional[str]:
+        """Gibt die Agenten-ID des aktuellen Lock-Inhabers zurück, falls vorhanden."""
+        section = self._sections.get(resource_key)
+        return section.holder_agent_id if section else None

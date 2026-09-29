@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
+
+from src.application.services import need_service
 from src.application.services.critical_section_coordinator import CriticalSectionCoordinator
 from src.application.services.dialogue_history import DialogueHistory
 from src.application.services.evasion_finder import EvasionFinder
@@ -24,6 +26,8 @@ from src.domain.models.world_entity import WorldEntity
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.services.perception_service import PerceptionService
+from src.application.services.need_service import NeedService
+from src.domain.services.precondition_evaluator import PreconditionEvaluator
 
 
 class ActionExecutor:
@@ -37,6 +41,7 @@ class ActionExecutor:
         perception_service: Optional[PerceptionService] = None,
         evasion_finder: Optional[EvasionFinder] = None,
         critical_section_coordinator: Optional[CriticalSectionCoordinator] = None,
+        need_service: Optional[NeedService] = None,
         tick_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         self._grid = grid
@@ -46,6 +51,8 @@ class ActionExecutor:
         self._pathfinder = pathfinder
         self._perception_service = perception_service or PerceptionService(default_radius=3)
         self._evasion_finder = evasion_finder or EvasionFinder(pathfinder)
+        self._need_service = need_service or NeedService()
+        self._precondition_evaluator = PreconditionEvaluator()
         self._tick_provider = tick_provider or (lambda: 0)
         self._critical_section_coordinator = (
             critical_section_coordinator
@@ -102,12 +109,14 @@ class ActionExecutor:
 
     @staticmethod
     def validate_pre_commit(
-        agent: Agent,
-        blocker: WorldEntity,
-        blocked_pos: Position,
+            agent: Agent,
+            blocker: WorldEntity,
+            blocked_pos: Position,
     ) -> bool:
         """TOCTOU-Schutz: Prüft unmittelbar vor Ausführung, ob die Blockade noch besteht."""
-        if not agent.has_path or agent.path[0] != blocked_pos:
+        if agent.has_path and agent.path[0] != blocked_pos:
+            return False
+        if not agent.has_path and agent.position.manhattan_distance(blocked_pos) > 1:
             return False
         if blocker.position != blocked_pos:
             return False
@@ -337,6 +346,8 @@ class ActionExecutor:
         agent.memory.record_inspection(blocker.id, blocker.entity_type)
         if isinstance(blocker, Agent) or blocker.is_conversational:
             agent.memory.record_walkability_result(blocker.id, is_walkable=False)
+        if not blocker.is_conversational:
+            agent.memory.record_interaction_result(blocker.id, responded=False)
 
         self._dialogue_history.record_dialogue(
             tick=current_tick,
@@ -372,7 +383,11 @@ class ActionExecutor:
         resource_key = f"entity:{blocker.id}"
         active_goal = agent.active_goal
         prio = active_goal.priority if active_goal else ExecutionPriority.ROUTINE
-        has_lock = self._critical_section_coordinator.acquire_or_queue(agent, resource_key, prio)
+        section = self._critical_section_coordinator.get_or_create_section(resource_key)
+        has_lock = (
+            self._critical_section_coordinator.acquire_or_queue(agent, resource_key, prio)
+            or section.completed_by == agent.id
+        )
 
         if not has_lock:
             self._goal_service.pause_goal(agent, incident_id=incident_id)
@@ -383,6 +398,8 @@ class ActionExecutor:
         agent.memory.record_type_walkability(
             blocker.entity_type, is_walkable=is_walkable, pos=blocker.position
         )
+        if not blocker.is_conversational:
+            agent.memory.record_interaction_result(blocker.id, responded=False)
 
         if not is_walkable and (
             not blocker.is_conversational
@@ -444,7 +461,9 @@ class ActionExecutor:
             return
 
         if isinstance(action, TalkAction):
-            target = self.find_entity(action.target_agent_id, all_entities) or blocker
+            target = self.find_entity(action.target_agent_id, all_entities)
+            if target is None or target.id == agent.id:
+                target = blocker
             target_name = target.name if target else action.target_agent_id
             target_id = target.id if target else None
 
@@ -604,3 +623,46 @@ class ActionExecutor:
                         agent.interaction_partner_id = target.id
                         if isinstance(target, Agent):
                             target.interaction_partner_id = agent.id
+
+    def execute_consume(
+            self,
+            agent: Agent,
+            target_entity: WorldEntity,
+            all_entities: list[WorldEntity],
+            incident_id: str = "",
+    ) -> bool:
+        """Führt den Verzehr eines benachbarten, konsumierbaren Objekts deterministisch aus."""
+        if not self._precondition_evaluator.can_consume(agent, target_entity):
+            return False
+
+        current_tick = self._tick_provider()
+
+        # 1. Objekt aus Weltzustand entfernen
+        if target_entity in all_entities:
+            all_entities.remove(target_entity)
+
+        # 2. Vitalwert Hunger über NeedService reduzieren
+        nutrition = getattr(target_entity, "nutrition_value", 0.0)
+        self._need_service.satisfy_need(agent, "hunger", reduction=nutrition)
+
+        # 3. Kognitives Gedächtnis aktualisieren: Objekt ist nicht mehr existent
+        if target_entity.id in agent.memory.known_entities:
+            del agent.memory.known_entities[target_entity.id]
+
+        # 4. Ereignis protokollieren
+        self._logger.log(
+            SimulationEvent(
+                tick=current_tick,
+                agent_id=agent.id,
+                event_type="entity_consumed",
+                summary=f"Agent {agent.name} verzehrt '{target_entity.name}' (Nährwert: {nutrition}). Hunger sinkt auf {agent.needs.get('hunger', 0.0):.2f}.",
+                payload={
+                    "incident_id": incident_id,
+                    "target_entity_id": target_entity.id,
+                    "target_entity_name": target_entity.name,
+                    "nutrition_value": nutrition,
+                    "remaining_hunger": agent.needs.get("hunger", 0.0),
+                },
+            )
+        )
+        return True

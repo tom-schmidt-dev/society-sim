@@ -64,3 +64,17 @@ class PerceptionService:
         if max_dist is None:
             return True
         return sender_pos.manhattan_distance(recipient_pos) <= max_dist
+
+    class PreconditionEvaluator:
+        """Deterministische Überprüfung von Vor- und Nachbedingungen für Aktionen."""
+
+        @staticmethod
+        def is_adjacent(agent: Agent, entity: WorldEntity) -> bool:
+            """Prüft Manhattan-Distanz <= 1 (direkte Nachbarschaft)."""
+            return agent.position.manhattan_distance(entity.position) <= 1
+
+        def can_consume(self, agent: Agent, entity: WorldEntity) -> bool:
+            """Prüft, ob ein Agent eine Entität unmittelbar verzehren kann."""
+            if not getattr(entity, "is_consumable", False):
+                return False
+            return self.is_adjacent(agent, entity)

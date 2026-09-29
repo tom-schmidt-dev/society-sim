@@ -63,7 +63,6 @@ class TestEvasionFinderCascade:
 
         start = Position(44, 22)
         blocked_pos = Position(45, 22)
-        # Partnertrajektorie deckt den gesamten Korridor ab
         partner_trajectory = [Position(x, 22) for x in range(40, 47)]
 
         result: EvasionResult | None = evasion_finder.find_nearest_evasion_tile(
@@ -121,7 +120,6 @@ class TestEvasionFinderCascade:
 
         assert result is not None
         assert result.target_tile == niche
-        # Vor dem Einbiegen auf (45, 21) verlässt der Pfad die Trajektorie bei (45, 22)
         assert result.junction_tile == Position(45, 22)
 
     def test_stage_3_frontier_fallback_when_no_niche_known(self, evasion_finder: EvasionFinder) -> None:
@@ -137,7 +135,6 @@ class TestEvasionFinderCascade:
 
         start = Position(11, 22)
         blocked_pos = Position(12, 22)
-        # Partnertrajektorie belegt alle bekannten Kacheln
         partner_trajectory = [Position(12, 22), Position(11, 22), Position(10, 22)]
 
         result = evasion_finder.find_nearest_evasion_tile(
@@ -211,6 +208,7 @@ class TestActionExecutorEvasionIntegration:
         assert alice.has_path is True
 
         # 2. Nachricht an Bob prüfen
+        bob.commit_staging_messages()
         assert len(bob.inbox) == 1
         msg = bob.inbox[0]
         assert msg.is_evasion_notice is True
@@ -241,6 +239,7 @@ class TestActionExecutorEvasionIntegration:
             thought="Kein Ausweg möglich.",
         )
 
+        bob.commit_staging_messages()
         assert alice.active_goal is None
         assert len(bob.inbox) == 1
         assert "Ich kann nicht ausweichen" in bob.inbox[0].message
