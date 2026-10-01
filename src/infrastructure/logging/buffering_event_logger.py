@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from src.application.services.daily_event_buffer import DailyEventBuffer
-from src.domain.models.events import SimulationEvent
+from src.application.services.lifecycle.daily_event_buffer import DailyEventBuffer
+from src.domain.models.planning.events import SimulationEvent
 from src.domain.ports.event_logger import IEventLogger
 
 

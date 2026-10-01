@@ -3,35 +3,35 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-from src.application.services.action_executor import ActionExecutor
-from src.application.services.agent_protocol_service import AgentProtocolService
-from src.application.services.cognition_orchestrator import CognitionOrchestrator
-from src.application.services.conflict_coordinator import ConflictCoordinator
-from src.application.services.convoy_arbitrator import ConvoyArbitrator
-from src.application.services.convoy_coordinator import ConvoyCoordinator
-from src.application.services.critical_section_coordinator import CriticalSectionCoordinator
-from src.application.services.day_night_service import DayNightService
-from src.application.services.dialogue_coordinator import DialogueCoordinator
-from src.application.services.dialogue_history import DialogueHistory
-from src.application.services.dialogue_session_manager import DialogueSessionManager
-from src.application.services.evasion_finder import EvasionFinder
-from src.application.services.frontier_explorer import FrontierExplorer
-from src.application.services.goal_service import GoalService
-from src.application.services.memory_consolidation_service import MemoryConsolidationService
-from src.application.services.movement_orchestrator import MovementOrchestrator
-from src.application.services.movement_sync_service import MovementSyncService
-from src.application.services.multi_agent_niche_packer import MultiAgentNichePacker
-from src.application.services.need_service import NeedService
-from src.application.services.plan_decomposition_service import PlanDecompositionService
-from src.application.services.target_search_service import TargetSearchService
-from src.domain.models.agent import Agent
-from src.domain.models.agent_cognition import AgentCognitiveSnapshot
-from src.domain.models.agent_memory import EntityFact
-from src.domain.models.goal import Goal
-from src.domain.models.position import Position
-from src.domain.models.reservation_table import ReservationTable
-from src.domain.models.world import WorldGrid
-from src.domain.models.world_entity import WorldEntity
+from src.application.services.execution.action_executor import ActionExecutor
+from src.application.services.coordination.agent_protocol_service import AgentProtocolService
+from src.application.services.cognition.cognition_orchestrator import CognitionOrchestrator
+from src.application.services.coordination.conflict_coordinator import ConflictCoordinator
+from src.application.services.coordination.convoy_arbitrator import ConvoyArbitrator
+from src.application.services.coordination.convoy_coordinator import ConvoyCoordinator
+from src.application.services.coordination.critical_section_coordinator import CriticalSectionCoordinator
+from src.application.services.lifecycle.day_night_service import DayNightService
+from src.application.services.coordination.dialogue_coordinator import DialogueCoordinator
+from src.application.services.coordination.dialogue_history import DialogueHistory
+from src.application.services.coordination.dialogue_session_manager import DialogueSessionManager
+from src.application.services.movement.evasion_finder import EvasionFinder
+from src.application.services.cognition.frontier_explorer import FrontierExplorer
+from src.application.services.cognition.goal_service import GoalService
+from src.application.services.lifecycle.memory_consolidation_service import MemoryConsolidationService
+from src.application.services.movement.movement_orchestrator import MovementOrchestrator
+from src.application.services.movement.movement_sync_service import MovementSyncService
+from src.application.services.movement.multi_agent_niche_packer import MultiAgentNichePacker
+from src.application.services.lifecycle.need_service import NeedService
+from src.application.services.cognition.plan_decomposition_service import PlanDecompositionService
+from src.application.services.movement.target_search_service import TargetSearchService
+from src.domain.models.agent.agent import Agent
+from src.domain.models.agent.agent_cognition import AgentCognitiveSnapshot
+from src.domain.models.agent.agent_memory import EntityFact
+from src.domain.models.planning.goal import Goal
+from src.domain.models.world.position import Position
+from src.domain.models.coordination.reservation_table import ReservationTable
+from src.domain.models.world.world import WorldGrid
+from src.domain.models.world.world_entity import WorldEntity
 from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.conflict_coordinator import IConflictCoordinator
 from src.domain.ports.dialogue_coordinator import IDialogueCoordinator
@@ -498,7 +498,13 @@ class SimulationEngine:
     def _process_epistemic_target_search(self, agent: Agent) -> None:
         """Löst Pfadsuche aus, wenn ein Agent ein Entitätsziel verfolgt, dessen genaue Position erst ermittelt werden muss."""
         active_goal = agent.active_goal
-        if not agent.is_busy and active_goal and active_goal.target_entity_id and not agent.has_path:
+        if (
+            not agent.is_busy
+            and active_goal
+            and active_goal.target_entity_id
+            and not agent.has_path
+            and not active_goal.name.startswith("SubGoal:")
+        ):
             search_res = self._target_search_service.search_target(
                 agent=agent,
                 target_entity_id=active_goal.target_entity_id,
@@ -573,38 +579,30 @@ class SimulationEngine:
     # Präsentations- und Lebenszyklussteuerung
     # ------------------------------------------------------------------
 
-    async def run(self, max_ticks: int = 20) -> None:
+    async def run(self, max_ticks: int = 20, stop_when_idle: bool = True) -> None:
         """
         Führt die Simulations-Hauptschleife aus:
-        - Rendert Initialzustand.
+        - Rendert Initialzustand mit Kognitions-Snapshots.
         - Führt Takte in festgelegten Intervallen aus, bis max_ticks erreicht sind oder alle Agenten ruhen.
         - Wartet auf den Abschluss aller asynchronen Hintergrund-Tasks bei Simulationsende.
         """
         self._is_running = True
         for agent in self._agents:
             self._update_agent_perception(agent)
+            self._cognition_orchestrator._capture_and_log_snapshot(agent, self._entities)
 
         known_tiles = self._collect_known_positions()
-        self._presenter.render(
-            self._grid,
-            self._entities,
-            self._current_tick,
-            self._dialogue_history.get_recent_formatted(limit=8),
-            known_positions=known_tiles,
-        )
+        self._render_current_state(known_tiles)
 
         while self._is_running and self._current_tick < max_ticks:
             await asyncio.sleep(self._tick_interval)
             await self.process_tick()
             known_tiles = self._collect_known_positions()
-            self._presenter.render(
-                self._grid,
-                self._entities,
-                self._current_tick,
-                self._dialogue_history.get_recent_formatted(limit=8),
-                known_positions=known_tiles,
-            )
-            if all(not a.has_path and not a.is_busy and not a.is_thinking for a in self._agents):
+            self._render_current_state(known_tiles)
+
+            if stop_when_idle and all(
+                not a.has_path and not a.is_busy and not a.is_thinking for a in self._agents
+            ):
                 break
 
         if self._background_tasks:

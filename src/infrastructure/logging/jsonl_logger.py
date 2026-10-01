@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
-from src.domain.models.events import SimulationEvent
+from src.domain.models.planning.events import SimulationEvent
 from src.domain.ports.event_logger import IEventLogger
 
 

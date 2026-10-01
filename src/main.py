@@ -14,10 +14,10 @@ if sys.prefix == sys.base_prefix:
     if venv_python.exists():
         os.execv(str(venv_python), [str(venv_python)] + sys.argv)
 
-from src.application.services.world_loader import WorldLoader
+from src.application.services.world.world_loader import WorldLoader
 from src.infrastructure.container import ApplicationContainer
-from src.domain.models.position import Position
-from src.domain.models.world_definition import (
+from src.domain.models.world.position import Position
+from src.domain.models.world.world_definition import (
     PlacedAgentData,
     PlacedEntityData,
     WorldDefinition,

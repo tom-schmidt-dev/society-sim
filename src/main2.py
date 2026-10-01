@@ -15,8 +15,8 @@ if sys.prefix == sys.base_prefix:
         os.execv(str(venv_python), [str(venv_python)] + sys.argv)
 
 from src.infrastructure.container import ApplicationContainer
-from src.domain.models.agent import Agent
-from src.domain.models.position import Position
+from src.domain.models.agent.agent import Agent
+from src.domain.models.world.position import Position
 
 
 def build_corridor(container: ApplicationContainer) -> None:

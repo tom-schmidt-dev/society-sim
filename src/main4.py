@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from src.infrastructure.container import ApplicationContainer
-from src.domain.models.agent import Agent
-from src.domain.models.goal import ExecutionPriority, Goal
-from src.domain.models.position import Position
-from src.domain.models.world_entity import WorldEntity
+from src.domain.models.agent.agent import Agent
+from src.domain.models.planning.goal import ExecutionPriority, Goal
+from src.domain.models.world.position import Position
+from src.domain.models.world.world_entity import WorldEntity
 
 
 def build_obstacle_course(container: ApplicationContainer) -> None:

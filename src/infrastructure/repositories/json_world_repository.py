@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from src.domain.models.world_definition import WorldDefinition
+from src.domain.models.world.world_definition import WorldDefinition
 
 
 class JsonWorldRepository:

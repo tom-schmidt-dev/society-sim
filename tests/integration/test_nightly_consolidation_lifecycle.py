@@ -6,16 +6,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.application.services.daily_event_buffer import DailyEventBuffer
-from src.application.services.day_night_service import DayNightService
-from src.application.services.memory_consolidation_service import MemoryConsolidationService
-from src.application.services.movement_orchestrator import MovementOrchestrator
-from src.application.services.cognition_orchestrator import CognitionOrchestrator
-from src.application.services.agent_protocol_service import AgentProtocolService
-from src.domain.models.agent import Agent
-from src.domain.models.events import SimulationEvent
-from src.domain.models.position import Position
-from src.domain.models.world import WorldGrid
+from src.application.services.lifecycle.daily_event_buffer import DailyEventBuffer
+from src.application.services.lifecycle.day_night_service import DayNightService
+from src.application.services.lifecycle.memory_consolidation_service import MemoryConsolidationService
+from src.application.services.movement.movement_orchestrator import MovementOrchestrator
+from src.application.services.cognition.cognition_orchestrator import CognitionOrchestrator
+from src.application.services.coordination.agent_protocol_service import AgentProtocolService
+from src.domain.models.agent.agent import Agent
+from src.domain.models.planning.events import SimulationEvent
+from src.domain.models.world.position import Position
+from src.domain.models.world.world import WorldGrid
 from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder

@@ -8,9 +8,9 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.domain.models.entity_blueprint import EntityBlueprint
-from src.domain.models.position import Position
-from src.domain.models.world_definition import (
+from src.domain.models.world.entity_blueprint import EntityBlueprint
+from src.domain.models.world.position import Position
+from src.domain.models.world.world_definition import (
     PlacedAgentData,
     PlacedEntityData,
     WorldDefinition,

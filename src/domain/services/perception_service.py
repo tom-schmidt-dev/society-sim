@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from typing import Optional
-from src.domain.models.agent import Agent
-from src.domain.models.message import CommunicationChannel
-from src.domain.models.position import Position
-from src.domain.models.world import WorldGrid
-from src.domain.models.world_entity import WorldEntity
+from src.domain.models.agent.agent import Agent
+from src.domain.models.communication.message import CommunicationChannel
+from src.domain.models.world.position import Position
+from src.domain.models.world.world import WorldGrid
+from src.domain.models.world.world_entity import WorldEntity
 
 
 class PerceptionService:

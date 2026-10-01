@@ -1,7 +1,7 @@
 from typing import Callable, Iterable, Optional
-from src.domain.models.agent import Agent
-from src.domain.models.agent_memory import EntityFact
-from src.domain.models.world_entity import WorldEntity
+from src.domain.models.agent.agent import Agent
+from src.domain.models.agent.agent_memory import EntityFact
+from src.domain.models.world.world_entity import WorldEntity
 
 
 class PreconditionEvaluator:

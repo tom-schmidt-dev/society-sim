@@ -1,14 +1,14 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
-from src.domain.models.cognition import (
+from src.domain.models.planning.cognition import (
     BlockedResolution,
     DialogueResolution,
     GoalDecision,
     GoalEvaluation,
 )
 from abc import ABC, abstractmethod
-from src.domain.models.planning import AgentCognitiveContext, PlanDecomposition
+from src.domain.models.planning.planning import AgentCognitiveContext, PlanDecomposition
 
 class ICognitionProvider(ABC):
     @abstractmethod

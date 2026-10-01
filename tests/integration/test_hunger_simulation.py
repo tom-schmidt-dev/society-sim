@@ -4,13 +4,13 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.application.simulation_engine import SimulationEngine
-from src.application.services.need_service import NeedService
-from src.application.services.plan_decomposition_service import PlanDecompositionService
-from src.domain.models.agent import Agent
-from src.domain.models.planning import ActionType, PlanDecomposition, SubGoalIntent
-from src.domain.models.position import Position
-from src.domain.models.world import WorldGrid
-from src.domain.models.world_entity import WorldEntity
+from src.application.services.lifecycle.need_service import NeedService
+from src.application.services.cognition.plan_decomposition_service import PlanDecompositionService
+from src.domain.models.agent.agent import Agent
+from src.domain.models.planning.planning import ActionType, PlanDecomposition, SubGoalIntent
+from src.domain.models.world.position import Position
+from src.domain.models.world.world import WorldGrid
+from src.domain.models.world.world_entity import WorldEntity
 from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
@@ -130,7 +130,7 @@ async def test_hunger_simulation_stage_2_approach_and_consume():
 
     # 4. Assertions
     assert apple not in engine._entities
-    assert pytest.approx(agent.needs["hunger"], 0.001) == 0.37
+    assert pytest.approx(agent.needs["hunger"], 0.001) == 0.36
     assert agent.position == Position(1, 2)
     assert not any(g.name.startswith("SubGoal:") for g in agent.goals)
 

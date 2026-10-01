@@ -1,7 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
-from src.domain.models.position import Position
+from src.domain.models.world.position import Position
 
 class IPathfinder(ABC):
     @abstractmethod

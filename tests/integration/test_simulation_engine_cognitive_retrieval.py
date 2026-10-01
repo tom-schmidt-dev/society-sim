@@ -5,24 +5,24 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.application.services.cognition_orchestrator import CognitionOrchestrator
-from src.application.services.daily_event_buffer import DailyEventBuffer
-from src.application.services.day_night_service import DayNightService
-from src.application.services.memory_consolidation_service import MemoryConsolidationService
-from src.application.services.movement_orchestrator import MovementOrchestrator
-from src.application.services.need_service import NeedService
-from src.application.services.plan_decomposition_service import PlanDecompositionService
+from src.application.services.cognition.cognition_orchestrator import CognitionOrchestrator
+from src.application.services.lifecycle.daily_event_buffer import DailyEventBuffer
+from src.application.services.lifecycle.day_night_service import DayNightService
+from src.application.services.lifecycle.memory_consolidation_service import MemoryConsolidationService
+from src.application.services.movement.movement_orchestrator import MovementOrchestrator
+from src.application.services.lifecycle.need_service import NeedService
+from src.application.services.cognition.plan_decomposition_service import PlanDecompositionService
 from src.application.simulation_engine import SimulationEngine
-from src.domain.models.agent import Agent
-from src.domain.models.events import SimulationEvent
-from src.domain.models.position import Position
-from src.domain.models.world import WorldGrid
+from src.domain.models.agent.agent import Agent
+from src.domain.models.planning.events import SimulationEvent
+from src.domain.models.world.position import Position
+from src.domain.models.world.world import WorldGrid
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
 from src.domain.ports.vector_memory_store import IVectorMemoryStore
 from src.domain.services.perception_service import PerceptionService
-from src.infrastructure.cognition.instructor_adapter import InstructorCognitionAdapter
+from src.infrastructure.cognition.adapters.instructor_adapter import InstructorCognitionAdapter
 
 
 # ==============================================================================

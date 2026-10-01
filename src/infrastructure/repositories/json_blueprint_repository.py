@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from src.domain.models.entity_blueprint import EntityBlueprint
+from src.domain.models.world.entity_blueprint import EntityBlueprint
 
 
 class JsonBlueprintRepository:

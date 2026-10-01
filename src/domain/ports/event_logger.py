@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from src.domain.models.events import SimulationEvent
+from src.domain.models.planning.events import SimulationEvent
 
 
 class IEventLogger(ABC):

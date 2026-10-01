@@ -1,7 +1,7 @@
 from __future__ import annotations
 import heapq
 from typing import Any
-from src.domain.models.position import Position
+from src.domain.models.world.position import Position
 from src.domain.ports.pathfinder import IPathfinder
 
 class AStarPathfinder(IPathfinder):
