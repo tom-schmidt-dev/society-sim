@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
-from src.container import ApplicationContainer
+from src.infrastructure.container import ApplicationContainer
 from src.domain.models.agent import Agent
 from src.domain.models.goal import Goal, ExecutionPriority
 from src.domain.models.mental_map import AgentMentalMap
 from src.domain.models.position import Position
-from src.domain.models.cognition import BlockedResolution, DialogueResolution, TalkAction
-from src.domain.ports.cognition_provider import ICognitionProvider
-from src.main2 import build_corridor
 
 
 class TestConvoyCorridorScenarios:

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from src.container import ApplicationContainer
+from src.infrastructure.container import ApplicationContainer
 from src.domain.models.agent import Agent
-from src.domain.models.position import Position
 from src.domain.models.world_definition import WorldDefinition
 from src.domain.models.world_entity import WorldEntity
 

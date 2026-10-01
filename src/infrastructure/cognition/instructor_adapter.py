@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Literal, Optional, cast
+import re
 import instructor
 import litellm
 
@@ -180,6 +181,11 @@ class InstructorCognitionAdapter(ICognitionProvider):
             f"Empfohlene Rolle laut Geometrie: '{recommended_role}'.",
             f"Letzter eingehender Intent des Partners: '{incoming_intent}'.",
         ]
+        social_memories = context.get("social_memories") or context.get("episodic_memories") or []
+        if social_memories:
+            prompt_lines.append("\nErinnerungen an frühere Interaktionen mit dem Partner:")
+            for mem in social_memories:
+                prompt_lines.append(f"- {mem}")
 
         if peer_bid_farewell:
             prompt_lines.extend([
@@ -217,14 +223,15 @@ class InstructorCognitionAdapter(ICognitionProvider):
         system_prompt = (
             "Du bist das Kognitions- und Planungsmodul eines autonomen Agenten in einer 2D-Gitter-Simulation.\n"
             "Deine Aufgabe ist es, für ein dringendes Bedürfnis des Agenten (z. B. 'hunger') einen strukturierten Handlungsplan zu erstellen.\n"
-            "Analysiere die Vitalwerte, die aktuelle Position und die bekannten Entitäten.\n"
+            "Analysiere die Vitalwerte, die aktuelle Position, bekannte Entitäten sowie abgerufene Erinnerungen ('episodic_memories').\n"
             "Formuliere deine Gedanken im Feld 'thought', benenne ein Primärziel ('primary_goal') "
             "und zerlege es in eine geordnete Liste von atomaren Teilzielen ('sub_goals').\n\n"
             "Zulässige Aktionen für Sub-Goals sind: 'move_to', 'explore', 'consume', 'wait', 'inspect'.\n"
             "Regeln:\n"
-            "1. Wenn keine passende Ressource bekannt ist, muss zuerst 'explore' gewählt werden.\n"
-            "2. Wenn eine passende Ressource bekannt ist, plane 'move_to' gefolgt von 'consume'.\n"
-            "3. Gib bei 'move_to' die Zielkoordinaten [x, y] und bei 'consume' die target_entity_id an."
+            "1. Wenn eine passende Ressource in 'known_entities' bekannt ist, plane 'move_to' gefolgt von 'consume'.\n"
+            "2. Wenn keine Ressource in 'known_entities' bekannt ist, aber 'episodic_memories' relevante Quellen oder Standorte enthalten, plane 'move_to' zu den erinnerten Koordinaten.\n"
+            "3. Wenn weder bekannte Entitäten noch zielführende Erinnerungen vorliegen, wähle zuerst 'explore'.\n"
+            "4. Gib bei 'move_to' die Zielkoordinaten [x, y] und bei 'consume' die target_entity_id an."
         )
 
         user_content = (
@@ -250,6 +257,28 @@ class InstructorCognitionAdapter(ICognitionProvider):
             self, context: AgentCognitiveContext
     ) -> PlanDecomposition:
         """Deterministischer Fallback-Planer bei nicht erreichbarem Sprachmodell."""
+        if not any(e.is_consumable and e.last_known_position for e in
+                   context.known_entities) and context.episodic_memories:
+            for memory_text in context.episodic_memories:
+                match = re.search(r"bei \((\d+),\s*(\d+)\)", memory_text)
+                if match:
+                    target_pos = (int(match.group(1)), int(match.group(2)))
+                    need = context.urgent_need or "Bedürfnis"
+                    return PlanDecomposition(
+                        thought=f"Fallback: Erinnere mich an Quelle bei {target_pos}.",
+                        primary_goal=f"{need} stillen",
+                        sub_goals=[
+                            SubGoalIntent(
+                                action_type=ActionType.MOVE_TO,
+                                target_position=target_pos,
+                                description=f"Gehe zu erinnerter Position {target_pos}",
+                            ),
+                            SubGoalIntent(
+                                action_type=ActionType.CONSUME,
+                                description="Konsumiere gefundene Ressource",
+                            ),
+                        ],
+                    )
         consumable = next(
             (e for e in context.known_entities if e.is_consumable and e.last_known_position),
             None,

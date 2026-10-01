@@ -10,6 +10,9 @@ class PreconditionEvaluator:
     # Standard-Kategoriengruppen für Systembedürfnisse
     RESOURCE_CATEGORIES: dict[str, set[str]] = {
         "consumable": {"food", "apple", "resource", "drink"},
+        "food": {"food", "apple", "resource", "bread", "berry"},
+        "drinkable": {"water", "well", "drink", "stream", "fountain"},
+        "rest_area": {"bed", "camp", "shelter", "bench", "home"},
         "building_material": {"wood", "stone", "iron", "plank"},
         "tool": {"axe", "pickaxe", "hammer"},
     }
@@ -22,6 +25,23 @@ class PreconditionEvaluator:
         if not getattr(entity, "is_consumable", False):
             return False
         return self.is_adjacent(agent, entity)
+
+    def can_drink(self, agent: Agent, entity: WorldEntity) -> bool:
+        if not (
+            getattr(entity, "is_drinkable", False)
+            or getattr(entity, "is_consumable", False)
+            or entity.entity_type in self.RESOURCE_CATEGORIES["drinkable"]
+        ):
+            return False
+        return self.is_adjacent(agent, entity)
+
+    def can_rest(self, agent: Agent, entity: WorldEntity) -> bool:
+        if not (
+            getattr(entity, "is_rest_area", False)
+            or entity.entity_type in self.RESOURCE_CATEGORIES["rest_area"]
+        ):
+            return False
+        return agent.position == entity.position or self.is_adjacent(agent, entity)
 
     def find_discovered_entity(
         self,

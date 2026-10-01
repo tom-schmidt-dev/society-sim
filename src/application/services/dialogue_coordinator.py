@@ -20,6 +20,7 @@ from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.dialogue_coordinator import IDialogueCoordinator
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
+from src.domain.ports.vector_memory_store import IVectorMemoryStore
 
 
 class DialogueCoordinator(IDialogueCoordinator):
@@ -34,6 +35,7 @@ class DialogueCoordinator(IDialogueCoordinator):
         session_manager: DialogueSessionManager,
         dialogue_history: DialogueHistory,
         tick_provider: Optional[Callable[[], int]] = None,
+        vector_memory_store: Optional[IVectorMemoryStore] = None,
     ) -> None:
         self._logger = logger
         self._cognition_provider = cognition_provider
@@ -44,6 +46,25 @@ class DialogueCoordinator(IDialogueCoordinator):
         self._session_manager = session_manager
         self._dialogue_history = dialogue_history
         self._tick_provider = tick_provider or (lambda: 0)
+        self._vector_memory_store = vector_memory_store
+
+    def _retrieve_social_memories(
+            self, agent_id: str, partner_id: Optional[str]
+    ) -> list[str]:
+        """Ruft Vergangenheitserfahrungen über den Interaktionspartner resilient ab."""
+        if not self._vector_memory_store or not partner_id:
+            return []
+
+        query = f"Begegnung mit {partner_id}"
+        try:
+            return self._vector_memory_store.retrieve_relevant(
+                agent_id=agent_id,
+                query=query,
+                limit=3,
+                metadata_filter={"category": "social"},
+            )
+        except Exception:
+            return []
 
     async def handle_incoming_dialogue(
         self,
@@ -129,6 +150,7 @@ class DialogueCoordinator(IDialogueCoordinator):
                 recommended_role = "pass"
 
             active_goal = agent.active_goal
+            social_memories = self._retrieve_social_memories(agent.id, partner_id)
             context = {
                 "agent_id": agent.id,
                 "name": agent.name,
@@ -150,6 +172,8 @@ class DialogueCoordinator(IDialogueCoordinator):
                 "peer_bid_farewell": agent.peer_bid_farewell,
                 "partner_is_yielding": partner_is_yielding,
                 "agent_is_yielding": agent_is_yielding,
+                "social_memories": social_memories,
+                "episodic_memories": social_memories,
             }
 
             if partner_id and self._session_manager.is_turn_limit_exceeded(agent.id, partner_id):

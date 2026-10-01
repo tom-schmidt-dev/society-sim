@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from src.container import ApplicationContainer
+from src.infrastructure.container import ApplicationContainer
 from src.domain.models.agent import Agent
 from src.domain.models.goal import ExecutionPriority, Goal
 from src.domain.models.position import Position

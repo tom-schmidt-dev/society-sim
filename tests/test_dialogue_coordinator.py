@@ -382,3 +382,148 @@ async def test_dialogue_accept_offer_yield_clears_waiting_flags_and_allows_movem
     assert alice.interaction_partner_id is None
     assert alice.is_busy is False
     assert session_manager.get_turn_count("1", "2") == 0
+
+@pytest.mark.asyncio
+async def test_dialogue_retrieves_social_memories_for_partner() -> None:
+    # TC-SOC-01: DialogCoordinator ruft soziale Erinnerungen über den Partner ab und bettet sie in den Kontext ein
+    grid = WorldGrid(width=20, height=20)
+    logger = MagicMock()
+    cognition = AsyncMock()
+    pathfinder = AStarPathfinder()
+    current_tick = 5
+
+    goal_service = GoalService(
+        logger=logger,
+        cognition_provider=cognition,
+        pathfinder=pathfinder,
+        tick_provider=lambda: current_tick,
+    )
+    evasion_finder = EvasionFinder(pathfinder=pathfinder)
+    dialogue_history = DialogueHistory()
+    session_manager = DialogueSessionManager(max_dialogue_turns=2)
+    executor = ActionExecutor(
+        grid=grid,
+        logger=logger,
+        dialogue_history=dialogue_history,
+        goal_service=goal_service,
+        pathfinder=pathfinder,
+        evasion_finder=evasion_finder,
+        tick_provider=lambda: current_tick,
+    )
+
+    mock_vector_store = MagicMock()
+    mock_vector_store.retrieve_relevant.return_value = [
+        "Tag 1: Begegnung mit Bob verlief cooperative."
+    ]
+
+    coordinator = DialogueCoordinator(
+        logger=logger,
+        cognition_provider=cognition,
+        pathfinder=pathfinder,
+        goal_service=goal_service,
+        evasion_finder=evasion_finder,
+        action_executor=executor,
+        session_manager=session_manager,
+        dialogue_history=dialogue_history,
+        tick_provider=lambda: current_tick,
+        vector_memory_store=mock_vector_store,
+    )
+
+    alice = Agent(id="1", name="Alice", position=Position(5, 5))
+    bob = Agent(id="2", name="Bob", position=Position(6, 5))
+    alice.receive_message(
+        IncomingMessage(
+            from_agent_id="2",
+            from_agent_name="Bob",
+            message="Hallo",
+            intent="talk",
+        )
+    )
+
+    cognition.respond_to_dialogue.return_value = DialogueResolution(
+        thought="Bob kenne ich als kooperativ.",
+        action=TalkAction(target_agent_id="2", message="Hallo Bob!", reason="Gruß"),
+        negotiation_intent="offer_yield",
+    )
+
+    await coordinator.handle_incoming_dialogue(alice, [alice, bob])
+
+    mock_vector_store.retrieve_relevant.assert_called_once_with(
+        agent_id="1",
+        query="Begegnung mit 2",
+        limit=3,
+        metadata_filter={"category": "social"},
+    )
+
+    context_arg = cognition.respond_to_dialogue.call_args[0][0]
+    assert context_arg["social_memories"] == [
+        "Tag 1: Begegnung mit Bob verlief cooperative."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_retrieval_resilient_on_vector_store_failure() -> None:
+    # TC-SOC-02: Bei einem Fehler im Vektorspeicher stürzt der Dialog nicht ab
+    grid = WorldGrid(width=20, height=20)
+    logger = MagicMock()
+    cognition = AsyncMock()
+    pathfinder = AStarPathfinder()
+    current_tick = 5
+
+    goal_service = GoalService(
+        logger=logger,
+        cognition_provider=cognition,
+        pathfinder=pathfinder,
+        tick_provider=lambda: current_tick,
+    )
+    evasion_finder = EvasionFinder(pathfinder=pathfinder)
+    dialogue_history = DialogueHistory()
+    session_manager = DialogueSessionManager(max_dialogue_turns=2)
+    executor = ActionExecutor(
+        grid=grid,
+        logger=logger,
+        dialogue_history=dialogue_history,
+        goal_service=goal_service,
+        pathfinder=pathfinder,
+        evasion_finder=evasion_finder,
+        tick_provider=lambda: current_tick,
+    )
+
+    mock_vector_store = MagicMock()
+    mock_vector_store.retrieve_relevant.side_effect = RuntimeError("Vektor-DB nicht erreichbar")
+
+    coordinator = DialogueCoordinator(
+        logger=logger,
+        cognition_provider=cognition,
+        pathfinder=pathfinder,
+        goal_service=goal_service,
+        evasion_finder=evasion_finder,
+        action_executor=executor,
+        session_manager=session_manager,
+        dialogue_history=dialogue_history,
+        tick_provider=lambda: current_tick,
+        vector_memory_store=mock_vector_store,
+    )
+
+    alice = Agent(id="1", name="Alice", position=Position(5, 5))
+    bob = Agent(id="2", name="Bob", position=Position(6, 5))
+    alice.receive_message(
+        IncomingMessage(
+            from_agent_id="2",
+            from_agent_name="Bob",
+            message="Hallo",
+            intent="talk",
+        )
+    )
+
+    cognition.respond_to_dialogue.return_value = DialogueResolution(
+        thought="Antwort ohne Gedächtnis",
+        action=TalkAction(target_agent_id="2", message="Hallo!", reason="Gruß"),
+        negotiation_intent="accept",
+    )
+
+    await coordinator.handle_incoming_dialogue(alice, [alice, bob])
+
+    assert alice.is_thinking is False
+    context_arg = cognition.respond_to_dialogue.call_args[0][0]
+    assert context_arg["social_memories"] == []

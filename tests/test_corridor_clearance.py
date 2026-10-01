@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from src.container import ApplicationContainer
+from src.infrastructure.container import ApplicationContainer
 from src.domain.models.agent import Agent
 from src.domain.models.position import Position
 from src.domain.models.cognition import BlockedResolution, DialogueResolution, TalkAction, InspectAction

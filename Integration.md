@@ -9,7 +9,7 @@ Führe umgehend ein systematisches Audit durch und binde die deterministische Ar
 ### 1. DIAGNOSE & ROOT-CAUSE-ANALYSE (IST-ZUSTAND PRÜFEN)
 
 Untersuche deterministisch die Aufrufkette ausgehend vom Einstiegspunkt bis zur Kognitionsabfrage:
-1. **Composition Root (`src/container.py`):**
+1. **Composition Root (`src/infrastructure/container.py`):**
    - Prüfe, welche Dienste in `ApplicationContainer.build()` instanziiert und an die `SimulationEngine` übergeben werden.
    - Werden die neuen Module (`MovementSyncService`, `MultiAgentNichePacker`, `ConvoyCoordinator`) dort instanziiert oder fehlen sie vollständig in der Verdrahtung?
 2. **Simulations-Schleife (`src/application/simulation_engine.py`):**
@@ -24,7 +24,7 @@ Untersuche deterministisch die Aufrufkette ausgehend vom Einstiegspunkt bis zur 
 
 Bringe die Architektur mit den Spezifikationen aus `Implementierungsplan.md` in Übereinstimmung:
 
-1. **Composition Root aktualisieren (`src/container.py`):**
+1. **Composition Root aktualisieren (`src/infrastructure/container.py`):**
    - Instanziiere die neuen Dienste (`MovementSyncService`, `MultiAgentNichePacker`, `ConvoyCoordinator`) zentral im Container.
    - Injiziere sie ordnungsgemäß in `SimulationEngine`, `GoalService` und die Koordinatoren.
 2. **Entkopplung von LLM-Inferenz bei Korridorkonflikten:**

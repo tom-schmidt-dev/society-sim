@@ -637,16 +637,21 @@ class ActionExecutor:
 
         current_tick = self._tick_provider()
 
-        # 1. Objekt aus Weltzustand entfernen
-        if target_entity in all_entities:
+        # 1. Objekt aus Weltzustand entfernen (sofern verbrauchbar)
+        is_depletable = getattr(target_entity, "is_depletable", True)
+        if is_depletable and target_entity in all_entities:
             all_entities.remove(target_entity)
 
-        # 2. Vitalwert Hunger über NeedService reduzieren
+        # 2. Vitalwerte über NeedService reduzieren
         nutrition = getattr(target_entity, "nutrition_value", 0.0)
         self._need_service.satisfy_need(agent, "hunger", reduction=nutrition)
 
-        # 3. Kognitives Gedächtnis aktualisieren: Objekt ist nicht mehr existent
-        if target_entity.id in agent.memory.known_entities:
+        hydration = getattr(target_entity, "hydration_value", 0.0)
+        if hydration > 0.0:
+            self._need_service.satisfy_need(agent, "thirst", reduction=hydration)
+
+        # 3. Kognitives Gedächtnis aktualisieren
+        if is_depletable and target_entity.id in agent.memory.known_entities:
             del agent.memory.known_entities[target_entity.id]
 
         # 4. Ereignis protokollieren
@@ -662,6 +667,83 @@ class ActionExecutor:
                     "target_entity_name": target_entity.name,
                     "nutrition_value": nutrition,
                     "remaining_hunger": agent.needs.get("hunger", 0.0),
+                },
+            )
+        )
+        return True
+
+    def execute_drink(
+        self,
+        agent: Agent,
+        target_entity: WorldEntity,
+        all_entities: list[WorldEntity],
+        incident_id: str = "",
+    ) -> bool:
+        """Führt das Trinken an einer benachbarten Trinkquelle deterministisch aus."""
+        if not self._precondition_evaluator.can_drink(agent, target_entity):
+            return False
+
+        current_tick = self._tick_provider()
+        hydration = getattr(target_entity, "hydration_value", 0.0) or getattr(target_entity, "nutrition_value", 0.4)
+        is_depletable = getattr(target_entity, "is_depletable", False)
+
+        if is_depletable and target_entity in all_entities:
+            all_entities.remove(target_entity)
+
+        self._need_service.satisfy_need(agent, "thirst", reduction=hydration)
+
+        if is_depletable and target_entity.id in agent.memory.known_entities:
+            del agent.memory.known_entities[target_entity.id]
+
+        self._logger.log(
+            SimulationEvent(
+                tick=current_tick,
+                agent_id=agent.id,
+                event_type="entity_drank",
+                summary=f"Agent {agent.name} trinkt an '{target_entity.name}' (Hydration: {hydration}). Durst sinkt auf {agent.needs.get('thirst', 0.0):.2f}.",
+                payload={
+                    "incident_id": incident_id,
+                    "target_entity_id": target_entity.id,
+                    "target_entity_name": target_entity.name,
+                    "hydration_value": hydration,
+                    "remaining_thirst": agent.needs.get("thirst", 0.0),
+                },
+            )
+        )
+        return True
+
+    def execute_rest(
+        self,
+        agent: Agent,
+        target_entity: Optional[WorldEntity] = None,
+        reduction: float = 0.3,
+        incident_id: str = "",
+    ) -> bool:
+        """Führt eine Erholungsaktion an einem Erholungsort oder an Ort und Stelle aus."""
+        if target_entity is not None and not self._precondition_evaluator.can_rest(agent, target_entity):
+            return False
+
+        current_tick = self._tick_provider()
+        effective_reduction = (
+            getattr(target_entity, "energy_recovery_value", reduction)
+            if target_entity is not None
+            else reduction
+        )
+
+        self._need_service.satisfy_need(agent, "energy", reduction=effective_reduction)
+
+        target_name = target_entity.name if target_entity else "vor Ort"
+        self._logger.log(
+            SimulationEvent(
+                tick=current_tick,
+                agent_id=agent.id,
+                event_type="agent_rested",
+                summary=f"Agent {agent.name} ruht sich aus ({target_name}, Erholung: {effective_reduction}). Erschöpfung sinkt auf {agent.needs.get('energy', 0.0):.2f}.",
+                payload={
+                    "incident_id": incident_id,
+                    "target_entity_id": target_entity.id if target_entity else None,
+                    "energy_recovery_value": effective_reduction,
+                    "remaining_energy_deficit": agent.needs.get("energy", 0.0),
                 },
             )
         )

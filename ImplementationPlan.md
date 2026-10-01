@@ -75,7 +75,7 @@ Das System folgt einer strikten Schichtenarchitektur (Hexagonal / Clean Architec
   - src/domain/ports/ (ICognitionProvider, IEventLogger, IPathfinder, IPresenter, etc.)
 ```
 
-- **Dependency Inversion:** Abhängigkeiten verlaufen ausnahmslos von außen nach innen. Klassen instanziieren ihre Abhängigkeiten nicht selbst, sondern erhalten sie über den Konstruktor (Dependency Injection via `src/container.py`).
+- **Dependency Inversion:** Abhängigkeiten verlaufen ausnahmslos von außen nach innen. Klassen instanziieren ihre Abhängigkeiten nicht selbst, sondern erhalten sie über den Konstruktor (Dependency Injection via `src/infrastructure/container.py`).
 - **Domain-Isolation:** `src/domain/` enthält keinerlei Importe aus `src/application/` oder `src/infrastructure/`.
 
 ---
@@ -324,12 +324,12 @@ Im Standardfall (z. B. Einzelagenten oder Konvois begegnen sich in einem Korrido
 - [x] **Phase 7: Systemintegration & Topologische Konvoi-Clearance (`SimulationEngine`)**
   - [x] 7.1 Integration von `MovementSyncService`, `ConvoyCoordinator`, `MultiAgentNichePacker` in `SimulationEngine`
   - [x] 7.2 Topologische Konvoi-Clearance mit Korridorzonen-Ausschluss in `_check_and_signal_clearance`
-  - [x] 7.3 Integration in `src/container.py` (Composition Root)
+  - [x] 7.3 Integration in `src/infrastructure/container.py` (Composition Root)
   - [x] 7.4 End-to-End-Integrationstests (`tests/test_convoy_corridor_scenarios.py`)
   - [x] 7.5 Vollständige Regression, Mypy-Typechecking & Abschlussvalidierung
 
 - [x] **Phase 8: Runtime-Integration & Entkopplung der LLM-Inferenz im aktiven Ausführungspfad (`Integration.md`)**
-  - [x] 8.1 Composition Root (`src/container.py`): Instanziierung von `ConvoyArbitrator` und Injection in `SimulationEngine` & `ConflictCoordinator`.
+  - [x] 8.1 Composition Root (`src/infrastructure/container.py`): Instanziierung von `ConvoyArbitrator` und Injection in `SimulationEngine` & `ConflictCoordinator`.
   - [x] 8.2 Entkopplung von LLM-Inferenz bei Korridorkonflikten (`ConflictCoordinator`): Deterministische FSM (`CONFLICT_DETECTED` -> `NEGOTIATING` -> `YIELDING_INGRESS`/`PASSING` -> `YIELDING_WAIT` -> `CLEARANCE_CONFIRMED` -> `EGRESS`) und stringente Emission von `DialogueTemplates`.
   - [x] 8.3 Phasentrennung in `SimulationEngine`: `YIELDING_WAIT` bei Nischenankunft, `CLEARANCE_CONFIRMED` bei topologischer Clearance, `EGRESS` bei Quittungsempfang.
   - [x] 8.4 Kognitionsinvariante: LLM-Inferenz (`resolve_blockage`) für stationäre und nicht-Agenten-Blockaden (`stone_1`) vollständig intakt.

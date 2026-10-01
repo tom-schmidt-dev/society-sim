@@ -372,6 +372,32 @@ class AgentProtocolService:
                     )
                 )
 
+    def signal_niche_junction_entry(
+            self, agent: Agent, current_goal: Optional[Goal], entities: list[WorldEntity]
+    ) -> None:
+        """Signaliert HALT an den Ausweichpartner bei Erreichen des Verzweigungspunkts."""
+        if (
+                current_goal is not None
+                and current_goal.junction_position is not None
+                and not current_goal.is_evasion_hold
+                and not current_goal.halt_signaled
+                and agent.position == current_goal.junction_position
+        ):
+            current_goal.halt_signaled = True
+            partner_id = current_goal.yield_for_agent_id
+            partner = next((e for e in entities if e.id == partner_id), None)
+            if partner:
+                partner.receive_message(
+                    IncomingMessage(
+                        from_agent_id=agent.id,
+                        from_agent_name=agent.name,
+                        message="HALT WARTE!",
+                        channel=CommunicationChannel.LOCAL_TALK,
+                        is_halt_request=True,
+                        correlation_key=f"niche-entry-{agent.id}",
+                    )
+                )
+
     def handle_niche_arrival(
             self, agent: Agent, current_goal: Goal, entities: list[WorldEntity]
     ) -> None:

@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.application.services.need_service import NeedService
-from src.container import ApplicationContainer
+from src.infrastructure.container import ApplicationContainer
 from src.domain.models.agent import Agent
 from src.domain.models.position import Position
 from src.domain.ports.cognition_provider import ICognitionProvider

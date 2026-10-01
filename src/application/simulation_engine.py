@@ -2,29 +2,34 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Optional
+
 from src.application.services.action_executor import ActionExecutor
+from src.application.services.agent_protocol_service import AgentProtocolService
+from src.application.services.cognition_orchestrator import CognitionOrchestrator
 from src.application.services.conflict_coordinator import ConflictCoordinator
 from src.application.services.convoy_arbitrator import ConvoyArbitrator
 from src.application.services.convoy_coordinator import ConvoyCoordinator
 from src.application.services.critical_section_coordinator import CriticalSectionCoordinator
+from src.application.services.day_night_service import DayNightService
 from src.application.services.dialogue_coordinator import DialogueCoordinator
 from src.application.services.dialogue_history import DialogueHistory
 from src.application.services.dialogue_session_manager import DialogueSessionManager
 from src.application.services.evasion_finder import EvasionFinder
+from src.application.services.frontier_explorer import FrontierExplorer
 from src.application.services.goal_service import GoalService
+from src.application.services.memory_consolidation_service import MemoryConsolidationService
+from src.application.services.movement_orchestrator import MovementOrchestrator
 from src.application.services.movement_sync_service import MovementSyncService
 from src.application.services.multi_agent_niche_packer import MultiAgentNichePacker
-from src.application.services.target_search_service import TargetSearchService
 from src.application.services.need_service import NeedService
 from src.application.services.plan_decomposition_service import PlanDecompositionService
+from src.application.services.target_search_service import TargetSearchService
 from src.domain.models.agent import Agent
-from src.domain.models.communication_templates import DialogueTemplates
-from src.domain.models.events import SimulationEvent
-from src.domain.models.evasion_phase import EvasionPhase
-from src.domain.models.goal import ExecutionPriority, Goal
-from src.domain.models.message import CommunicationChannel, IncomingMessage
+from src.domain.models.agent_cognition import AgentCognitiveSnapshot
+from src.domain.models.agent_memory import EntityFact
+from src.domain.models.goal import Goal
 from src.domain.models.position import Position
-from src.domain.models.reservation_table import ReservationTable, TileReservationIntent
+from src.domain.models.reservation_table import ReservationTable
 from src.domain.models.world import WorldGrid
 from src.domain.models.world_entity import WorldEntity
 from src.domain.ports.cognition_provider import ICognitionProvider
@@ -33,14 +38,14 @@ from src.domain.ports.dialogue_coordinator import IDialogueCoordinator
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
+from src.domain.ports.vector_memory_store import IVectorMemoryStore
 from src.domain.services.perception_service import PerceptionService
-
-from src.domain.models.agent_memory import EntityFact
-from src.application.services.frontier_explorer import FrontierExplorer
 from src.domain.services.precondition_evaluator import PreconditionEvaluator
-from src.application.services.agent_protocol_service import AgentProtocolService
+
 
 class SimulationEngine:
+    """Fassade und Takt-Orchestrator für die deterministische Multi-Agenten-Simulation."""
+
     def __init__(
         self,
         grid: WorldGrid,
@@ -61,11 +66,19 @@ class SimulationEngine:
         convoy_coordinator: Optional[ConvoyCoordinator] = None,
         niche_packer: Optional[MultiAgentNichePacker] = None,
         convoy_arbitrator: Optional[ConvoyArbitrator] = None,
-        need_service: Optional[NeedService] = None,  # <-- NEU
-        plan_decomposition_service: Optional[PlanDecompositionService] = None,  # <-- NEU
+        need_service: Optional[NeedService] = None,
+        day_night_service: Optional[DayNightService] = None,
+        plan_decomposition_service: Optional[PlanDecompositionService] = None,
+        frontier_explorer: Optional[FrontierExplorer] = None,
+        precondition_evaluator: Optional[PreconditionEvaluator] = None,
+        movement_orchestrator: Optional[MovementOrchestrator] = None,
+        cognition_orchestrator: Optional[CognitionOrchestrator] = None,
+        protocol_service: Optional[AgentProtocolService] = None,
         enable_deterministic_corridor: bool = True,
+        memory_consolidation_service: Optional[MemoryConsolidationService] = None,
+        vector_memory_store: Optional[IVectorMemoryStore] = None,
     ) -> None:
-        self._entities: list[WorldEntity] = []
+        """Initialisiert Simulationszustand, Basisdienste sowie Kognitions-, Bewegungs- und Protokoll-Orchestratoren."""
         self._grid: WorldGrid = grid
         self._pathfinder: IPathfinder = pathfinder
         self._presenter: IPresenter = presenter
@@ -73,12 +86,14 @@ class SimulationEngine:
         self._tick_interval: float = tick_interval
         self._auditory_radius: int = auditory_radius
 
+        self._entities: list[WorldEntity] = []
         self._agents: list[Agent] = []
         self._current_tick: int = 0
         self._is_running: bool = False
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._delayed_agent_ids: set[str] = set()
 
-        self._reservation_table = ReservationTable()
+        # Basisdienste
         self._dialogue_history = dialogue_history or DialogueHistory()
         self._perception_service = perception_service or PerceptionService(default_radius=3)
         self._goal_service = goal_service or GoalService(
@@ -88,18 +103,31 @@ class SimulationEngine:
         self._session_manager = DialogueSessionManager(max_dialogue_turns=2, logger=self._logger)
         self._critical_section_coordinator = (
             critical_section_coordinator
-            or CriticalSectionCoordinator(logger=self._logger, tick_provider=lambda: self._current_tick)
+            or CriticalSectionCoordinator(
+                logger=self._logger, tick_provider=lambda: self._current_tick
+            )
         )
-        self._frontier_explorer = FrontierExplorer()
-        self._precondition_evaluator = PreconditionEvaluator()
+        self._convoy_coordinator = convoy_coordinator or ConvoyCoordinator(
+            pathfinder=self._pathfinder,
+            logger=self._logger,
+        )
+        self._niche_packer = niche_packer or MultiAgentNichePacker()
+        self._convoy_arbitrator = convoy_arbitrator or ConvoyArbitrator()
 
-        self._need_service = need_service or NeedService()
+        effective_need_service = need_service or NeedService()
+        self._day_night_service = day_night_service or DayNightService(logger=self._logger)
 
-        self._delayed_agent_ids: set[str] = set()
-
-        self._plan_decomposition_service = (
+        effective_plan_decomp_service = (
             plan_decomposition_service
             or PlanDecompositionService(cognition_provider=cognition_provider)
+        )
+
+        effective_plan_decomp_service = (
+                plan_decomposition_service
+                or PlanDecompositionService(
+            cognition_provider=cognition_provider,
+            vector_memory_store=vector_memory_store,
+        )
         )
 
         self._target_search_service = target_search_service or TargetSearchService(
@@ -109,7 +137,6 @@ class SimulationEngine:
             logger=self._logger,
         )
 
-        # ANPASSUNG: need_service an ActionExecutor übergeben
         self._action_executor = ActionExecutor(
             grid=self._grid,
             logger=self._logger,
@@ -119,22 +146,16 @@ class SimulationEngine:
             perception_service=self._perception_service,
             evasion_finder=self._evasion_finder,
             critical_section_coordinator=self._critical_section_coordinator,
-            need_service=self._need_service,
+            need_service=effective_need_service,
             tick_provider=lambda: self._current_tick,
         )
 
+        reservation_table = ReservationTable()
         self._movement_sync_service = movement_sync_service or MovementSyncService(
             logger=self._logger,
-            reservation_table=self._reservation_table,
+            reservation_table=reservation_table,
         )
-        self._convoy_coordinator = convoy_coordinator or ConvoyCoordinator(
-            pathfinder=self._pathfinder,
-            logger=self._logger,
-        )
-        self._niche_packer = niche_packer or MultiAgentNichePacker()
-        self._convoy_arbitrator = convoy_arbitrator or ConvoyArbitrator()
-        self._conflict_coordinator = conflict_coordinator
-        self._dialogue_coordinator = dialogue_coordinator
+
         self._conflict_coordinator = conflict_coordinator or ConflictCoordinator(
             logger=self._logger,
             cognition_provider=cognition_provider,
@@ -149,8 +170,8 @@ class SimulationEngine:
             niche_packer=self._niche_packer,
             convoy_arbitrator=self._convoy_arbitrator,
             enable_deterministic_corridor=enable_deterministic_corridor,
-
         )
+
         self._dialogue_coordinator = dialogue_coordinator or DialogueCoordinator(
             logger=self._logger,
             cognition_provider=cognition_provider,
@@ -161,9 +182,11 @@ class SimulationEngine:
             session_manager=self._session_manager,
             dialogue_history=self._dialogue_history,
             tick_provider=lambda: self._current_tick,
+            vector_memory_store=vector_memory_store,
         )
 
-        self._protocol_service = AgentProtocolService(
+        # Extrahierte Orchestratoren
+        self._protocol_service = protocol_service or AgentProtocolService(
             grid=self._grid,
             pathfinder=self._pathfinder,
             logger=self._logger,
@@ -174,69 +197,150 @@ class SimulationEngine:
             conflict_coordinator=self._conflict_coordinator,
             auditory_radius=self._auditory_radius,
             tick_provider=lambda: self._current_tick,
-
-
         )
+
+        self._movement_orchestrator = movement_orchestrator or MovementOrchestrator(
+            grid=self._grid,
+            pathfinder=self._pathfinder,
+            movement_sync_service=self._movement_sync_service,
+            reservation_table=reservation_table,
+            protocol_service=self._protocol_service,
+            conflict_coordinator=self._conflict_coordinator,
+            on_agent_moved=self._update_agent_perception,
+            tick_provider=lambda: self._current_tick,
+        )
+
+        self._cognition_orchestrator = cognition_orchestrator or CognitionOrchestrator(
+            pathfinder=self._pathfinder,
+            logger=self._logger,
+            goal_service=self._goal_service,
+            need_service=effective_need_service,
+            plan_decomposition_service=effective_plan_decomp_service,
+            action_executor=self._action_executor,
+            frontier_explorer=frontier_explorer,
+            precondition_evaluator=precondition_evaluator,
+            tick_provider=lambda: self._current_tick,
+        )
+        self._memory_consolidation_service = memory_consolidation_service
+        self._vector_memory_store = vector_memory_store
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def latest_cognitive_snapshots(self) -> list[AgentCognitiveSnapshot]:
+        """Liefert die aktuellen Kognitions-Snapshots aller Agenten."""
+        return self._cognition_orchestrator.latest_snapshots
+
+    def _render_current_state(self, known_tiles: set[Position]) -> None:
+        dialogues = self._dialogue_history.get_recent_formatted(limit=8)
+        snapshots = self.latest_cognitive_snapshots
+        try:
+            self._presenter.render(
+                self._grid,
+                self._entities,
+                self._current_tick,
+                dialogues=dialogues,
+                known_positions=known_tiles,
+                snapshots=snapshots,
+            )
+        except TypeError:
+            self._presenter.render(
+                self._grid,
+                self._entities,
+                self._current_tick,
+                dialogues=dialogues,
+                known_positions=known_tiles,
+            )
 
     @property
     def current_tick(self) -> int:
+        """Gibt den aktuellen Simulationszyklus zurück."""
         return self._current_tick
 
     @property
     def dialogue_history(self) -> DialogueHistory:
+        """Liefert das Protokoll aller getätigten Dialoge."""
         return self._dialogue_history
 
     @property
     def critical_section_coordinator(self) -> CriticalSectionCoordinator:
+        """Verwaltet exklusive Belegungsrechte für kritische räumliche Abschnitte."""
         return self._critical_section_coordinator
 
     @property
     def movement_sync_service(self) -> MovementSyncService:
+        """Führt den atomaren Zwei-Phasen-Commit für Positionswechsel aus."""
         return self._movement_sync_service
 
     @property
     def convoy_coordinator(self) -> ConvoyCoordinator:
+        """Verwaltet koordinierte Gruppenbewegungen in Engpässen."""
         return self._convoy_coordinator
 
     @property
     def niche_packer(self) -> MultiAgentNichePacker:
+        """Berechnet Ausweichkonfigurationen für mehrere Agenten in Nischen."""
         return self._niche_packer
 
     @property
     def convoy_arbitrator(self) -> ConvoyArbitrator:
+        """Trifft Vorfahrtsentscheidungen bei aufeinandertreffenden Konvois."""
         return self._convoy_arbitrator
 
+    @property
+    def movement_orchestrator(self) -> MovementOrchestrator:
+        """Orchestriert Phase 2: Arbitrierung, Ausweichmanöver und physische Bewegung."""
+        return self._movement_orchestrator
+
+    @property
+    def cognition_orchestrator(self) -> CognitionOrchestrator:
+        """Orchestriert Phase 1: Vitalwerte, hierarchische Dekomposition und Sub-Goals."""
+        return self._cognition_orchestrator
+
+    @property
+    def protocol_service(self) -> AgentProtocolService:
+        """Verwaltet Nachrichten-Routing, Dialogabstände und Interaktionsanfragen."""
+        return self._protocol_service
+
+    # ------------------------------------------------------------------
+    # Registrierung & Entitätsmanagement
+    # ------------------------------------------------------------------
+
     def register_entity(self, entity: WorldEntity) -> None:
+        """
+        Registriert ein statisches oder interaktives Objekt im Gitter.
+        - Validiert die Begehbarkeit der Zielposition.
+        - Fügt die Entität der globalen Objektliste hinzu.
+        """
         if not self._grid.is_walkable(entity.position):
             raise ValueError(f"Position {entity.position} für Objekt {entity.name} ist blockiert.")
         self._entities.append(entity)
-        self._logger.log(
-            SimulationEvent(
-                tick=self._current_tick,
-                agent_id=entity.id,
-                event_type="entity_registered",
-                summary=f"Objekt '{entity.name}' platziert.",
-                payload={"x": entity.position.x, "y": entity.position.y},
-            )
-        )
 
     def register_agent(self, agent: Agent) -> None:
+        """
+        Fügt einen neuen Agenten zur Simulation hinzu.
+        - Prüft die Startposition auf Kollisionsfreiheit.
+        - Initialisiert die Abmessungen der agentenspezifischen mentalen Karte.
+        - Trägt den Agenten in die Entitäts- und Agentenverwaltung ein.
+        """
         if not self._grid.is_walkable(agent.position):
             raise ValueError(f"Startposition {agent.position} für Agent {agent.name} blockiert.")
         if agent not in self._entities:
             self._entities.append(agent)
         self._agents.append(agent)
         agent.mental_map.set_bounds(self._grid.width, self._grid.height)
-        self._logger.log(
-            SimulationEvent(
-                tick=self._current_tick,
-                agent_id=agent.id,
-                event_type="agent_registered",
-                summary=f"Agent {agent.name} registriert an ({agent.position.x}, {agent.position.y}).",
-            )
-        )
 
-    def set_agent_target(self, agent_id: str, target: Position, destination_name: str = "Ziel") -> None:
+    def set_agent_target(
+        self, agent_id: str, target: Position, destination_name: str = "Ziel"
+    ) -> None:
+        """
+        Weist einem Agenten ein explizites Navigationsziel von außen zu.
+        - Setzt bestehende Zielstacks zurück.
+        - Registriert das neue Ziel im GoalService.
+        - Führt eine Sensorik-Aktualisierung durch und berechnet den initialen Pfad.
+        """
         agent = next((a for a in self._agents if a.id == agent_id), None)
         if not agent:
             raise ValueError(f"Agent '{agent_id}' nicht gefunden.")
@@ -249,10 +353,21 @@ class SimulationEngine:
             agent.assign_path(path)
 
     def _update_agent_perception(self, agent: Agent) -> list[WorldEntity]:
-        visible_positions = self._perception_service.get_visible_positions(agent.position, self._grid)
+        """
+        Aktualisiert das Umweltwissen eines einzelnen Agenten.
+        - Erfasst sichtbare Kacheln und trägt statische Hindernisse in die mentale Karte ein.
+        - Aktualisiert bekannte Entitätsfakten (Position, Typ) im Gedächtnis.
+        - Markiert unpassierbare, epistemisch erschöpfte Entitäten als Hindernis.
+        """
+        visible_positions = self._perception_service.get_visible_positions(
+            agent.position, self._grid
+        )
         for pos in visible_positions:
             tile_type = self._grid.get_tile_type(pos)
-            if not self._grid.is_walkable(pos) or agent.memory.get_type_assumed_walkable(tile_type) is False:
+            if (
+                not self._grid.is_walkable(pos)
+                or agent.memory.get_type_assumed_walkable(tile_type) is False
+            ):
                 agent.mental_map.mark_obstacle(pos, self._current_tick)
             else:
                 agent.mental_map.update_tile(pos, is_walkable=True, tick=self._current_tick)
@@ -275,97 +390,71 @@ class SimulationEngine:
         return visible_entities
 
     def _collect_known_positions(self) -> set[Position]:
+        """Sammelt alle Positionen, die von mindestens einem Agenten bereits erkundet wurden (für den Presenter)."""
         discovered: set[Position] = set()
         for agent in self._agents:
             discovered.update(agent.mental_map.tiles.keys())
         return discovered
 
-
-
-    def _notify_next_critical_section_holder(self, resource_key: str, next_agent_id: str) -> None:
-        """Aktiviert den nächsten Agenten in der Warteschlange und stößt die Notwendigkeitsprüfung an."""
-        next_agent = next((a for a in self._agents if a.id == next_agent_id), None)
-        if not next_agent or not next_agent.active_goal:
-            return
-
-        is_completed = self._critical_section_coordinator.is_completed(resource_key)
-        is_still_needed = self._goal_service.validate_goal_necessity(
-            agent=next_agent,
-            goal=next_agent.active_goal,
-            is_already_completed=is_completed,
-            incident_id=f"cs-notify-t{self._current_tick}-{resource_key}",
-        )
-        if is_still_needed:
-            self._goal_service.resume_goal(next_agent)
-            active_goal = next_agent.active_goal
-            if active_goal and active_goal.target_position:
-                new_path = self._pathfinder.find_path(
-                    next_agent.position, active_goal.target_position, next_agent.mental_map
-                )
-                if new_path:
-                    next_agent.assign_path(new_path)
-
-
-    def _interrupt_goal_for_replan(
-        self,
-        agent: Agent,
-        reason: str,
-        discovered_fact: Optional[EntityFact] = None,
-    ) -> None:
-        """Bricht aktive Pfade und Ziele kontrolliert ab, um eine Neu-Dekompensation anzustoßen."""
-        agent.clear_path()
-        agent.goals.clear()
-
-        payload: dict[str, Any] = {"reason": reason}
-        if discovered_fact:
-            payload["discovered_entity_id"] = discovered_fact.entity_id
-            payload["entity_type"] = discovered_fact.entity_type
-            if discovered_fact.last_known_position:
-                payload["position"] = [
-                    discovered_fact.last_known_position.x,
-                    discovered_fact.last_known_position.y,
-                ]
-
-        self._logger.log(
-            SimulationEvent(
-                tick=self._current_tick,
-                agent_id=agent.id,
-                event_type="goal_interrupted_for_replan",
-                summary=f"Agent {agent.name}: Ziel abgebrochen wegen '{reason}'. Re-Planung initiiert.",
-                payload=payload,
-            )
-        )
+    # ------------------------------------------------------------------
+    # Taktzyklus (Zweiphasen-Commit)
+    # ------------------------------------------------------------------
 
     async def process_tick(self) -> None:
-        """Führt einen deterministischen zweiphasigen Simulationszyklus aus."""
+        """
+        Führt einen deterministischen Simulationszyklus aus:
+        - Phase 1: Staging-Commit, Sensorik-Aktualisierung, Kognition/Vitalwerte und Protokollbearbeitung.
+        - Phase 2: Reservierungsarbitrierung, physischer Zwei-Phasen-Commit (nur am Tag).
+        """
         self._current_tick += 1
+
+        # 0. Tag-Nacht-Synchronisation & nächtliche Konsolidierung
+        phase_event = self._day_night_service.process_tick(self._current_tick, self._agents)
+        is_night = self._day_night_service.is_night(self._current_tick)
+
+        if phase_event == "night_started" and self._memory_consolidation_service:
+            day_number = self._day_night_service.get_day_number(self._current_tick)
+            self._memory_consolidation_service.consolidate_all(
+                agents=self._agents,
+                day_number=day_number,
+                tick=self._current_tick,
+            )
 
         # ==========================================================
         # PHASE 1: Intention, Doppel-Puffer-Commit & Kognition
         # ==========================================================
         self._commit_staging_messages()
         self._update_perceptions_and_timed_goals()
-        await self._process_agent_needs_and_cognition()
+        await self._cognition_orchestrator.process_agent_needs_and_cognition(
+            self._agents, self._entities
+        )
         self._process_agent_communications_and_protocols()
 
         # ==========================================================
-        # PHASE 2: Arbitrierung & Physische Bewegung
+        # PHASE 2: Arbitrierung & Physische Bewegung (pausiert bei Nacht)
         # ==========================================================
-        self._execute_physical_movement()
-        self._commit_staging_messages()
+        if not is_night:
+            self._movement_orchestrator.execute_physical_movement(
+                agents=self._agents,
+                entities=self._entities,
+                delayed_agent_ids=self._delayed_agent_ids,
+                background_tasks=self._background_tasks,
+            )
+            self._commit_staging_messages()
+
         await asyncio.sleep(0)
 
-    # ------------------------------------------------------------------
-    # Phase 1: Teilmethoden
-    # ------------------------------------------------------------------
-
     def _commit_staging_messages(self) -> None:
-        """Überführt Staging-Nachrichten aller Entitäten deterministisch."""
+        """Überträgt zwischengespeicherte Staging-Nachrichten in die aktiven Inboxes aller Entitäten."""
         for entity in self._entities:
             entity.commit_staging_messages()
 
     def _update_perceptions_and_timed_goals(self) -> None:
-        """Aktualisiert Zeitziele und Sensorik der Agenten inklusive Pfadvalidierung."""
+        """
+        Bereitet Agenten auf die Kognition vor:
+        - Zählt Time-to-Live für zeitbefristete Ziele herunter.
+        - Aktualisiert das Sichtfeld und revalidiert geplante Pfade gegen neu entdeckte Hindernisse.
+        """
         for agent in self._agents:
             if agent.active_goal:
                 self._goal_service.process_timed_goal(agent)
@@ -374,7 +463,11 @@ class SimulationEngine:
             if agent.has_path and not agent.is_busy:
                 if any(not agent.mental_map.is_walkable(p) for p in agent.path):
                     active_goal = agent.active_goal
-                    if active_goal and active_goal.target_position and not active_goal.is_evasion_hold:
+                    if (
+                        active_goal
+                        and active_goal.target_position
+                        and not active_goal.is_evasion_hold
+                    ):
                         new_path = self._pathfinder.find_path(
                             agent.position, active_goal.target_position, agent.mental_map
                         )
@@ -383,126 +476,13 @@ class SimulationEngine:
                         else:
                             agent.clear_path()
 
-    async def _process_agent_needs_and_cognition(self) -> None:
-        """Überwacht Bedürfnisse, triggert Plandekomposition und führt Sub-Goals aus."""
-        for agent in self._agents:
-            consumed_in_tick = False
-
-            # 1. Plandekomposition bei akutem Hunger & leerem Zielstack
-            if (
-                not agent.is_busy
-                and not agent.goals
-                and self._need_service.is_need_urgent(agent, "hunger")
-            ):
-                await self._trigger_plan_decomposition(agent, "hunger")
-
-            # 2. Ausführung & Evaluation aktiver Sub-Goals
-            current_goal = agent.active_goal
-            if current_goal and not agent.is_busy:
-                if current_goal.name == "SubGoal: move_to":
-                    self._handle_subgoal_move_to(agent, current_goal)
-                elif current_goal.name.startswith("SubGoal: explore"):
-                    self._handle_subgoal_explore(agent, current_goal)
-                elif current_goal.name == "SubGoal: consume":
-                    consumed_in_tick = self._handle_subgoal_consume(agent, current_goal)
-
-            # 3. Zyklischer Vitalwertzuwachs pro Takt
-            if not consumed_in_tick:
-                self._need_service.update_needs(agent)
-
-    async def _trigger_plan_decomposition(self, agent: Agent, need_name: str) -> None:
-        """Erzeugt einen neuen hierarchischen Plan über den Kognitionsservice."""
-        plan = await self._plan_decomposition_service.create_plan_for_need(agent, need_name)
-        primary_goal = Goal(name=plan.primary_goal)
-        self._goal_service.push_goal(agent, primary_goal)
-
-        for intent in reversed(plan.sub_goals):
-            target_pos = (
-                Position(intent.target_position[0], intent.target_position[1])
-                if intent.target_position
-                else None
-            )
-            sub_goal = Goal(
-                name=f"SubGoal: {intent.action_type.value}",
-                target_position=target_pos,
-                target_entity_id=intent.target_entity_id,
-                description=intent.description,
-            )
-            self._goal_service.push_goal(agent, sub_goal)
-
-    def _handle_subgoal_move_to(self, agent: Agent, current_goal: Goal) -> None:
-        """Verwaltet Pfadzuweisung für direkte Navigations-Teilziele."""
-        if current_goal.target_position and not agent.has_path:
-            if agent.position != current_goal.target_position:
-                path = self._pathfinder.find_path(
-                    agent.position,
-                    current_goal.target_position,
-                    agent.mental_map,
-                )
-                if path:
-                    agent.assign_path(path)
-
-    def _handle_subgoal_explore(self, agent: Agent, current_goal: Goal) -> None:
-        """Evaluiert Ressourcenfunde und steuert Grenzkachel-Exploration."""
-        target_categories = self._precondition_evaluator.RESOURCE_CATEGORIES.get("consumable", set())
-        discovered = self._precondition_evaluator.find_discovered_entity(
-            agent, categories=target_categories
-        )
-
-        if discovered:
-            self._interrupt_goal_for_replan(
-                agent=agent,
-                reason=f"Ressource vom Typ '{discovered.entity_type}' entdeckt",
-                discovered_fact=discovered,
-            )
-        else:
-            if not agent.has_path and not agent.is_busy:
-                target_frontier = self._frontier_explorer.find_nearest_frontier(
-                    agent.position, agent.mental_map
-                )
-                if target_frontier:
-                    path = self._pathfinder.find_path(
-                        agent.position, target_frontier, agent.mental_map
-                    )
-                    if path:
-                        agent.assign_path(path)
-                        current_goal.target_position = target_frontier
-
-            if current_goal.target_position and agent.position == current_goal.target_position:
-                self._goal_service.pop_goal(agent)
-
-    def _handle_subgoal_consume(self, agent: Agent, current_goal: Goal) -> bool:
-        """Führt Konsumaktion deterministisch aus."""
-        target_entity = None
-        if current_goal.target_entity_id:
-            target_entity = next(
-                (e for e in self._entities if e.id == current_goal.target_entity_id), None
-            )
-        if not target_entity and current_goal.target_position:
-            target_entity = next(
-                (e for e in self._entities if e.position == current_goal.target_position), None
-            )
-
-        if not target_entity:
-            return False
-
-        consumed = self._action_executor.execute_consume(
-            agent=agent,
-            target_entity=target_entity,
-            all_entities=self._entities,
-            incident_id=f"consume-t{self._current_tick}-{agent.id}",
-        )
-        if consumed:
-            self._goal_service.pop_goal(agent)
-            if not self._need_service.is_need_urgent(agent, "hunger"):
-                active_g = agent.active_goal
-                if active_g and not any(g.name.startswith("SubGoal:") for g in agent.goals):
-                    self._goal_service.pop_goal(agent)
-            return True
-        return False
-
     def _process_agent_communications_and_protocols(self) -> None:
-        """Bearbeitet Protokolle, Inboxes und Interaktionsqueues via ProtocolService."""
+        """
+        Koordiniert die nachgelagerten Protokolle nach der Kognition:
+        - Identifiziert verzögerte Agenten mit Inbox-Nachrichten.
+        - Verarbeitet Inboxes, Interaktionsqueues und Distanzen via AgentProtocolService.
+        - Führt epistemische Zielsuchen durch und prüft Zielankünfte.
+        """
         self._delayed_agent_ids = {
             agent.id for agent in self._agents if agent.inbox and not agent.is_thinking
         }
@@ -515,9 +495,8 @@ class SimulationEngine:
             self._process_epistemic_target_search(agent)
             self._process_goal_arrival(agent)
 
-
     def _process_epistemic_target_search(self, agent: Agent) -> None:
-        """Initiiert Zielsuche bei Zielen mit bekannter Entitäts-ID ohne Pfad."""
+        """Löst Pfadsuche aus, wenn ein Agent ein Entitätsziel verfolgt, dessen genaue Position erst ermittelt werden muss."""
         active_goal = agent.active_goal
         if not agent.is_busy and active_goal and active_goal.target_entity_id and not agent.has_path:
             search_res = self._target_search_service.search_target(
@@ -531,9 +510,17 @@ class SimulationEngine:
                 agent.assign_path(search_res.path)
 
     def _process_goal_arrival(self, agent: Agent) -> None:
-        """Überprüft Nischenankunft und Freigabe kritischer Abschnitte an Zielkoordinaten."""
+        """
+        Prüft, ob der Agent sein Ziel erreicht hat:
+        - Löst bei Nischenankunft das entsprechende Ausweichhalteprotokoll aus.
+        - Gibt bei Ankunft an einem Zielkachel-Ressourcenschloss die kritische Sektion frei und weckt wartende Agenten.
+        """
         current_goal = agent.active_goal
-        if not (current_goal and current_goal.target_position and agent.position == current_goal.target_position):
+        if not (
+            current_goal
+            and current_goal.target_position
+            and agent.position == current_goal.target_position
+        ):
             return
         if current_goal.is_evasion_hold:
             return
@@ -541,7 +528,9 @@ class SimulationEngine:
         if current_goal.junction_position is not None:
             self._protocol_service.handle_niche_arrival(agent, current_goal, self._entities)
         else:
-            resource_key = f"pos:{current_goal.target_position.x},{current_goal.target_position.y}"
+            resource_key = (
+                f"pos:{current_goal.target_position.x},{current_goal.target_position.y}"
+            )
             next_agent_id = self._critical_section_coordinator.release(
                 agent_id=agent.id, resource_key=resource_key, mark_completed=True
             )
@@ -549,144 +538,48 @@ class SimulationEngine:
             if next_agent_id:
                 self._notify_next_critical_section_holder(resource_key, next_agent_id)
 
-    # ------------------------------------------------------------------
-    # Phase 2: Teilmethoden
-    # ------------------------------------------------------------------
+    def _notify_next_critical_section_holder(self, resource_key: str, next_agent_id: str) -> None:
+        """
+        Aktiviert den nächsten wartenden Agenten nach Freigabe einer Ressource:
+        - Prüft per Notwendigkeitscheck, ob das Ziel weiterhin erforderlich ist.
+        - Weckt den Agenten auf und weist einen neuen Pfad zum Ziel zu.
+        """
+        next_agent = next((a for a in self._agents if a.id == next_agent_id), None)
+        if not next_agent:
+            return
 
-    def _execute_physical_movement(self) -> None:
-        """Führt Arbitrierung, Zweiphasen-Commit und Konfliktbehandlung aus."""
-        self._reservation_table.clear()
+        active_goal = next_agent.active_goal
+        if not active_goal:
+            return
 
-        # 1. Schrittwünsche sammeln und reservieren
-        intents: list[TileReservationIntent] = []
-        for agent in self._agents:
-            if agent.id in self._delayed_agent_ids:
-                continue
-            if agent.has_path and not agent.is_busy:
-                target_pos = agent.path[0]
-                active_goal = agent.active_goal
-                prio = active_goal.priority if active_goal else ExecutionPriority.ROUTINE
-                dist = len(agent.path)
-                is_backtracking = bool(active_goal and active_goal.backtracking_junction_target is not None)
-                intent = TileReservationIntent(
-                    agent_id=agent.id,
-                    current_position=agent.position,
-                    desired_position=target_pos,
-                    priority=prio,
-                    distance_to_goal=dist,
-                    is_backtracking=is_backtracking,
-                )
-                intents.append(intent)
-                self._reservation_table.request_reservation(intent)
-
-        # 2. Physische Ausführung via Zweiphasen-Commit
-        occupied_stationary = {e.position for e in self._entities if not isinstance(e, Agent)}
-        sync_result = self._movement_sync_service.execute_two_phase_commit(
-            agents=self._agents,
-            intents=intents,
-            grid=self._grid,
-            occupied_positions=occupied_stationary,
-            tick=self._current_tick,
+        is_completed = self._critical_section_coordinator.is_completed(resource_key)
+        is_still_needed = self._goal_service.validate_goal_necessity(
+            agent=next_agent,
+            goal=active_goal,
+            is_already_completed=is_completed,
+            incident_id=f"cs-notify-t{self._current_tick}-{resource_key}",
         )
-
-        for agent in self._agents:
-            if agent.id in sync_result.committed_agents:
-                self._handle_committed_agent_post_move(agent)
-            elif not agent.has_path or agent.is_busy:
-                self._protocol_service.check_and_signal_clearance(agent, self._entities)
-            else:
-                self._handle_blocked_agent(agent)
-
-    def _handle_committed_agent_post_move(self, agent: Agent) -> None:
-        """Aktualisiert Sensorik und Signalisierung für erfolgreich bewegte Agenten."""
-        self._update_agent_perception(agent)
-        current_goal = agent.active_goal
-
-        if (
-            current_goal is not None
-            and current_goal.junction_position is not None
-            and not current_goal.is_evasion_hold
-            and not current_goal.halt_signaled
-            and agent.position == current_goal.junction_position
-        ):
-            current_goal.halt_signaled = True
-            partner_id = current_goal.yield_for_agent_id
-            partner = next((e for e in self._entities if e.id == partner_id), None)
-            if partner:
-                partner.receive_message(
-                    IncomingMessage(
-                        from_agent_id=agent.id,
-                        from_agent_name=agent.name,
-                        message="HALT WARTE!",
-                        channel=CommunicationChannel.LOCAL_TALK,
-                        is_halt_request=True,
-                        correlation_key=f"niche-entry-{agent.id}",
-                    )
+        if is_still_needed:
+            self._goal_service.resume_goal(next_agent)
+            resumed_goal = next_agent.active_goal
+            if resumed_goal and resumed_goal.target_position:
+                new_path = self._pathfinder.find_path(
+                    next_agent.position, resumed_goal.target_position, next_agent.mental_map
                 )
+                if new_path:
+                    next_agent.assign_path(new_path)
 
-        if (
-            current_goal is not None
-            and current_goal.target_position is not None
-            and agent.position == current_goal.target_position
-            and not current_goal.is_evasion_hold
-            and current_goal.junction_position is not None
-        ):
-            self._protocol_service.handle_niche_arrival(agent, current_goal, self._entities)
-
-        self._protocol_service.check_and_signal_clearance(agent, self._entities)
-
-    def _handle_blocked_agent(self, agent: Agent) -> None:
-        """Initiiert Konfliktauflösung für blockierte Bewegungsschritte."""
-        next_pos = agent.path[0]
-        blocker = next((e for e in self._entities if e.position == next_pos), None)
-        if blocker:
-            if isinstance(blocker, Agent):
-                blocker_goal = blocker.active_goal
-                if (
-                    blocker.is_evasion_locked
-                    or (blocker_goal and blocker_goal.yield_for_agent_id == agent.id)
-                ):
-                    return
-
-                if self._conflict_coordinator:
-                    agent.is_thinking = True
-                    task = asyncio.create_task(
-                        self._conflict_coordinator.resolve_blockage(
-                            agent, blocker, next_pos, self._entities
-                        )
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-            else:
-                if not agent.memory.is_epistemically_exhausted(blocker.id) and self._conflict_coordinator:
-                    agent.is_thinking = True
-                    task = asyncio.create_task(
-                        self._conflict_coordinator.resolve_blockage(
-                            agent, blocker, next_pos, self._entities
-                        )
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                else:
-                    agent.mental_map.mark_obstacle(next_pos, self._current_tick)
-                    self._replan_around_obstacle(agent)
-        elif not self._grid.is_walkable(next_pos):
-            agent.mental_map.mark_obstacle(next_pos, self._current_tick)
-            self._replan_around_obstacle(agent)
-
-    def _replan_around_obstacle(self, agent: Agent) -> None:
-        """Berechnet Pfad neu, wenn ein statisches Hindernis festgestellt wurde."""
-        active_goal = agent.active_goal
-        if active_goal and active_goal.target_position and not active_goal.is_evasion_hold:
-            new_path = self._pathfinder.find_path(
-                agent.position, active_goal.target_position, agent.mental_map
-            )
-            if new_path:
-                agent.assign_path(new_path)
-            else:
-                agent.clear_path()
+    # ------------------------------------------------------------------
+    # Präsentations- und Lebenszyklussteuerung
+    # ------------------------------------------------------------------
 
     async def run(self, max_ticks: int = 20) -> None:
+        """
+        Führt die Simulations-Hauptschleife aus:
+        - Rendert Initialzustand.
+        - Führt Takte in festgelegten Intervallen aus, bis max_ticks erreicht sind oder alle Agenten ruhen.
+        - Wartet auf den Abschluss aller asynchronen Hintergrund-Tasks bei Simulationsende.
+        """
         self._is_running = True
         for agent in self._agents:
             self._update_agent_perception(agent)
@@ -719,15 +612,60 @@ class SimulationEngine:
 
         self._is_running = False
 
+    # ------------------------------------------------------------------
+    # Fassaden-Delegationen (Rückwärtskompatibilität & Test-Verträge)
+    # ------------------------------------------------------------------
+
     def _check_and_signal_clearance(self, agent: Agent) -> None:
+        """Delegiert Chokepoint-Clearance-Signalisierung an den ProtocolService."""
         self._protocol_service.check_and_signal_clearance(agent, self._entities)
 
     def _handle_niche_arrival(self, agent: Agent, current_goal: Goal) -> None:
+        """Delegiert Nischenankunft und Halteabsicherung an den ProtocolService."""
         self._protocol_service.handle_niche_arrival(agent, current_goal, self._entities)
 
     def _replan_agent_path_avoiding(self, agent: Agent, forbidden_tiles: set[Position]) -> None:
+        """Delegiert Pfadneuberechnung unter Ausschluss gesperrter Kacheln an den ProtocolService."""
         self._protocol_service.replan_agent_path_avoiding(agent, forbidden_tiles)
 
     def _is_in_corridor_zone(self, pos: Position) -> bool:
+        """Delegiert Prüfung auf Korridorgeometrie an den ProtocolService."""
         return self._protocol_service.is_in_corridor_zone(pos)
 
+    def _interrupt_goal_for_replan(
+        self,
+        agent: Agent,
+        reason: str,
+        discovered_fact: Optional[EntityFact] = None,
+    ) -> None:
+        """Delegiert opportunistischen Zielabbruch und Neuplanung an den CognitionOrchestrator."""
+        self._cognition_orchestrator.interrupt_goal_for_replan(agent, reason, discovered_fact)
+
+    def _execute_physical_movement(self) -> None:
+        """Delegiert Phase 2 (Arbitrierung, Zwei-Phasen-Commit, Kollisionsbehandlung) an den MovementOrchestrator."""
+        self._movement_orchestrator.execute_physical_movement(
+            agents=self._agents,
+            entities=self._entities,
+            delayed_agent_ids=self._delayed_agent_ids,
+            background_tasks=self._background_tasks,
+        )
+
+    def _handle_committed_agent_post_move(self, agent: Agent) -> None:
+        """Delegiert Nachbereitung erfolgreicher Schritte (Sensorik, Nischensignale) an den MovementOrchestrator."""
+        self._movement_orchestrator.handle_committed_agent_post_move(agent, self._entities)
+
+    def _handle_blocked_agent(self, agent: Agent) -> None:
+        """Delegiert Kollisionsbehandlung und Konflikt-Tasks an den MovementOrchestrator."""
+        self._movement_orchestrator.handle_blocked_agent(
+            agent, self._entities, self._background_tasks
+        )
+
+    def _replan_around_obstacle(self, agent: Agent) -> None:
+        """Delegiert statische Hindernis-Neuberechnung an den MovementOrchestrator."""
+        self._movement_orchestrator.replan_around_obstacle(agent)
+
+    async def _process_agent_needs_and_cognition(self) -> None:
+        """Delegiert Phase 1 (Vitalwerte, Plandekomposition, Sub-Goal-Ausführung) an den CognitionOrchestrator."""
+        await self._cognition_orchestrator.process_agent_needs_and_cognition(
+            self._agents, self._entities
+        )
