@@ -160,7 +160,9 @@ class AgentProtocolService:
 
         # 7. Asynchroner Dialogstart
         if agent.inbox and self._dialogue_coordinator:
-            agent.is_thinking = True
+            sender_id = agent.inbox[-1].from_agent_id if agent.inbox else None
+            sender_name = next((e.name for e in entities if e.id == sender_id), "Partner")
+            agent.set_thinking(True, reason=f"Führt Dialog mit {sender_name}")
             task = asyncio.create_task(
                 self._dialogue_coordinator.handle_incoming_dialogue(agent, entities)
             )
@@ -303,13 +305,29 @@ class AgentProtocolService:
         background_tasks: set[asyncio.Task[Any]],
     ) -> None:
         current_tick = self._tick_provider()
+
+        # 1. Wenn der Ziel-Agent denkt, wird die Queue nicht abgearbeitet und die TTL friert ein
+        if agent.is_thinking:
+            for req in agent.interaction_queue:
+                req.freeze_tick(current_tick)
+            return
+
         while not agent.is_busy and agent.interaction_queue:
-            req = agent.interaction_queue.pop(0)
+            req = agent.interaction_queue[0]
             requester_entity = next((e for e in entities if e.id == req.requester_id), None)
             if not isinstance(requester_entity, Agent):
+                agent.interaction_queue.pop(0)
                 continue
 
             requester: Agent = requester_entity
+
+            # 2. Wenn der anfragende Agent gerade denkt, bleibt die Anfrage unangetastet in der Queue
+            if requester.is_thinking:
+                req.freeze_tick(current_tick)
+                break
+
+            agent.interaction_queue.pop(0)
+
             if req.is_expired(current_tick):
                 requester.is_waiting_for_reply = False
                 requester.interaction_partner_id = None
@@ -347,7 +365,7 @@ class AgentProtocolService:
                     )
                 )
                 if self._conflict_coordinator:
-                    requester.is_thinking = True
+                    requester.set_thinking(True, reason=f"Löst Blockade mit {agent.name}")
                     task = asyncio.create_task(
                         self._conflict_coordinator.resolve_blockage(
                             requester, agent, req.blocked_pos, entities

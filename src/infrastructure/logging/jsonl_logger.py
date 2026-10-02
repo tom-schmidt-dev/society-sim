@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
+from typing import Optional
 from src.domain.models.planning.events import SimulationEvent
 from src.domain.ports.event_logger import IEventLogger
 
@@ -12,9 +13,13 @@ class JsonlEventLogger(IEventLogger):
         self,
         base_dir: str = "logs",
         prefix: str = "simulation_events",
+        file_path: Optional[str | Path] = None,
     ) -> None:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self._file_path = Path(base_dir) / f"{prefix}_{timestamp}.jsonl"
+        if file_path is not None:
+            self._file_path = Path(file_path)
+        else:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self._file_path = Path(base_dir) / f"{prefix}_{timestamp}.jsonl"
         self._ensure_directory()
 
     def _ensure_directory(self) -> None:

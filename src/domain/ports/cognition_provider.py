@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from typing import Any
 from src.domain.models.planning.cognition import (
@@ -6,9 +7,10 @@ from src.domain.models.planning.cognition import (
     DialogueResolution,
     GoalDecision,
     GoalEvaluation,
+    SocialReflection,
 )
-from abc import ABC, abstractmethod
 from src.domain.models.planning.planning import AgentCognitiveContext, PlanDecomposition
+
 
 class ICognitionProvider(ABC):
     @abstractmethod
@@ -31,9 +33,13 @@ class ICognitionProvider(ABC):
         """Erzeugt eine Antwort oder beendet den Dialog auf Basis empfangener Nachrichten."""
         pass
 
+    @abstractmethod
+    async def reflect_on_dialogue(self, context: dict[str, Any]) -> SocialReflection:
+        """Bildet nach Abschluss eines Gesprächs eine soziale Einschätzung und Zusammenfassung."""
+        pass
+
     async def decompose_plan(
-            self, context: AgentCognitiveContext
+        self, context: AgentCognitiveContext
     ) -> PlanDecomposition:
         """Zerlegt den Kognitionskontext eines Agenten in ein Primärziel und Teilziele."""
         pass
-

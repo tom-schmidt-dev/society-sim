@@ -35,10 +35,12 @@ class EvasionFinder:
         occupied_positions: set[Position],
         partner_trajectory: Optional[Sequence[Position] | set[Position]] = None,
         search_direction: Optional[tuple[float, float]] = None,
+        allow_frontier: bool = True,
     ) -> Optional[EvasionResult]:
         """Ermittelt per 3-Stufen-Kaskade das Ausweichfeld und den Schnittpunkt zur Räumung."""
         trajectory_set = set(partner_trajectory) if partner_trajectory else set()
-        physical_obstacles: set[Position] = set(occupied_positions) - {blocked_pos}
+        # blocked_pos ist eine reale physische Blockade und darf nicht durchschritten werden
+        physical_obstacles: set[Position] = (set(occupied_positions) | {blocked_pos}) - {start}
         forbidden_targets: set[Position] = set(occupied_positions) | {blocked_pos} | trajectory_set
 
         queue: list[Position] = [start]
@@ -69,7 +71,7 @@ class EvasionFinder:
         chosen_tile = stage1_match or stage2_match
         is_frontier_match = False
 
-        if not chosen_tile and isinstance(grid, AgentMentalMap):
+        if allow_frontier and not chosen_tile and isinstance(grid, AgentMentalMap):
             frontier_forbidden = set(occupied_positions) | {blocked_pos}
             chosen_tile, frontier_came_from = self._find_nearest_frontier(
                 start=start,
@@ -176,7 +178,7 @@ class EvasionFinder:
             agent_b: Any,
             all_entities: list[Any],
     ) -> tuple[Optional[EvasionResult], Optional[EvasionResult]]:
-        """Ermittelt und vergleicht die Nischenwege für zwei Agenten ohne gegenseitige Blockade."""
+        """Ermittelt und vergleicht die Nischenwege für zwei Agenten unter Beachtung realer Pfaderreichbarkeit."""
         other_occupied = {e.position for e in all_entities if e.id not in (agent_a.id, agent_b.id)}
 
         res_a = self.find_nearest_evasion_tile(
@@ -185,6 +187,7 @@ class EvasionFinder:
             grid=agent_a.mental_map,
             occupied_positions=other_occupied,
             partner_trajectory=agent_b.path if agent_b.has_path else None,
+            allow_frontier=False,
         )
 
         res_b = self.find_nearest_evasion_tile(
@@ -193,6 +196,7 @@ class EvasionFinder:
             grid=agent_b.mental_map,
             occupied_positions=other_occupied,
             partner_trajectory=agent_a.path if agent_a.has_path else None,
+            allow_frontier=False,
         )
 
         return res_a, res_b

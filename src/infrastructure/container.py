@@ -51,20 +51,23 @@ class ApplicationContainer:
 
     @classmethod
     def build(
-        cls,
-        width: int = 10,
-        height: int = 10,
-        tick_interval: float = 0.3,
-        auditory_radius: int = 3,
-        log_file: str = "logs/simulation_events.jsonl",
-        blockage_strategy: Literal["action_masking", "reflection"] = "action_masking",
-        cognition_provider: Optional[ICognitionProvider] = None,
-        need_service: Optional[NeedService] = None,
-        day_night_service: Optional[DayNightService] = None,
-        vector_store: Optional[IVectorMemoryStore] = None,
-        memory_consolidation_service: Optional[MemoryConsolidationService] = None,
-        frame_buffer: Optional[FrameBufferService] = None,
+            cls,
+            width: int = 10,
+            height: int = 10,
+            tick_interval: float = 0.3,
+            auditory_radius: int = 3,
+            log_file: str = "logs/simulation_events.jsonl",
+            blockage_strategy: Literal["action_masking", "reflection"] = "action_masking",
+            cognition_provider: Optional[ICognitionProvider] = None,
+            need_service: Optional[NeedService] = None,
+            day_night_service: Optional[DayNightService] = None,
+            vector_store: Optional[IVectorMemoryStore] = None,
+            memory_consolidation_service: Optional[MemoryConsolidationService] = None,
+            frame_buffer: Optional[FrameBufferService] = None,
+            enable_deterministic_corridor: bool = True,
+            enable_day_night: bool = True,
     ) -> ApplicationContainer:
+
         grid = WorldGrid(width=width, height=height)
         pathfinder: IPathfinder = AStarPathfinder()
 
@@ -73,7 +76,7 @@ class ApplicationContainer:
 
         # 1. Logger & Basis-Dienste
         daily_event_buffer = DailyEventBuffer()
-        raw_logger: IEventLogger = JsonlEventLogger()
+        raw_logger: IEventLogger = JsonlEventLogger(file_path=log_file)
         logger: IEventLogger = BufferingEventLogger(
             inner_logger=raw_logger, buffer=daily_event_buffer
         )
@@ -134,6 +137,8 @@ class ApplicationContainer:
             day_night_service=day_night_service,
             memory_consolidation_service=memory_consolidation_service,
             vector_memory_store=vector_store,
+            enable_deterministic_corridor=enable_deterministic_corridor,
+            enable_day_night=enable_day_night,
         )
 
 

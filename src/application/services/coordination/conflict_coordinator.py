@@ -77,7 +77,7 @@ class ConflictCoordinator(IConflictCoordinator):
         try:
             async with self._session_manager.acquire_session(agent.id, blocker.id, tick=current_tick) as lock_granted:
                 if not lock_granted:
-                    agent.is_thinking = False
+                    agent.set_thinking(False)
                     return
 
                 # 1. Schnelle Vorabprüfung
@@ -248,7 +248,7 @@ class ConflictCoordinator(IConflictCoordinator):
                     if isinstance(blocker, Agent):
                         blocker.is_listening_to_peer = False
         finally:
-            agent.is_thinking = False
+            agent.set_thinking(False)
 
     def _is_corridor_encounter(
         self,
@@ -589,5 +589,5 @@ class ConflictCoordinator(IConflictCoordinator):
         self._session_manager.mark_negotiated(agent.id, blocker.id, current_tick)
         self._session_manager.mark_negotiated(leader_agent.id, leader_blocker.id, current_tick)
         self._session_manager.reset_session(agent.id, blocker.id)
-        agent.is_thinking = False
-        blocker.is_thinking = False
+        agent.set_thinking(False)
+        blocker.set_thinking = False

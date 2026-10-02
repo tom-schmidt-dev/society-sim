@@ -85,6 +85,8 @@ def main() -> None:
         height=9,
         tick_interval=0.15,
         auditory_radius=4,
+        enable_deterministic_corridor=False,
+        enable_day_night=False,
     )
 
     build_corridor_world(container)

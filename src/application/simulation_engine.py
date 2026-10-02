@@ -44,8 +44,6 @@ from src.domain.services.precondition_evaluator import PreconditionEvaluator
 
 
 class SimulationEngine:
-    """Fassade und Takt-Orchestrator für die deterministische Multi-Agenten-Simulation."""
-
     def __init__(
         self,
         grid: WorldGrid,
@@ -75,9 +73,11 @@ class SimulationEngine:
         cognition_orchestrator: Optional[CognitionOrchestrator] = None,
         protocol_service: Optional[AgentProtocolService] = None,
         enable_deterministic_corridor: bool = True,
+        enable_day_night: bool = True,  # Neu: Tag-Nacht-Steuerung umschaltbar
         memory_consolidation_service: Optional[MemoryConsolidationService] = None,
         vector_memory_store: Optional[IVectorMemoryStore] = None,
     ) -> None:
+        self._enable_day_night = enable_day_night
         """Initialisiert Simulationszustand, Basisdienste sowie Kognitions-, Bewegungs- und Protokoll-Orchestratoren."""
         self._grid: WorldGrid = grid
         self._pathfinder: IPathfinder = pathfinder
@@ -100,7 +100,7 @@ class SimulationEngine:
             logger, cognition_provider, pathfinder, tick_provider=lambda: self._current_tick
         )
         self._evasion_finder = EvasionFinder(pathfinder)
-        self._session_manager = DialogueSessionManager(max_dialogue_turns=2, logger=self._logger)
+        self._session_manager = DialogueSessionManager(max_dialogue_turns=None, logger=self._logger)
         self._critical_section_coordinator = (
             critical_section_coordinator
             or CriticalSectionCoordinator(
@@ -401,24 +401,22 @@ class SimulationEngine:
     # ------------------------------------------------------------------
 
     async def process_tick(self) -> None:
-        """
-        Führt einen deterministischen Simulationszyklus aus:
-        - Phase 1: Staging-Commit, Sensorik-Aktualisierung, Kognition/Vitalwerte und Protokollbearbeitung.
-        - Phase 2: Reservierungsarbitrierung, physischer Zwei-Phasen-Commit (nur am Tag).
-        """
         self._current_tick += 1
 
         # 0. Tag-Nacht-Synchronisation & nächtliche Konsolidierung
-        phase_event = self._day_night_service.process_tick(self._current_tick, self._agents)
-        is_night = self._day_night_service.is_night(self._current_tick)
+        if self._enable_day_night:
+            phase_event = self._day_night_service.process_tick(self._current_tick, self._agents)
+            is_night = self._day_night_service.is_night(self._current_tick)
 
-        if phase_event == "night_started" and self._memory_consolidation_service:
-            day_number = self._day_night_service.get_day_number(self._current_tick)
-            self._memory_consolidation_service.consolidate_all(
-                agents=self._agents,
-                day_number=day_number,
-                tick=self._current_tick,
-            )
+            if phase_event == "night_started" and self._memory_consolidation_service:
+                day_number = self._day_night_service.get_day_number(self._current_tick)
+                self._memory_consolidation_service.consolidate_all(
+                    agents=self._agents,
+                    day_number=day_number,
+                    tick=self._current_tick,
+                )
+        else:
+            is_night = False
 
         # ==========================================================
         # PHASE 1: Intention, Doppel-Puffer-Commit & Kognition

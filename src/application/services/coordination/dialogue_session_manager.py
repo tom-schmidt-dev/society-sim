@@ -10,19 +10,38 @@ from src.domain.ports.event_logger import IEventLogger
 class DialogueSessionManager:
     def __init__(
         self,
-        max_dialogue_turns: int = 2,
+        max_dialogue_turns: Optional[int] = None,  # None = unbegrenzt
         default_lock_timeout: float = 1.5,
         logger: Optional[IEventLogger] = None,
     ) -> None:
-        self._max_dialogue_turns: int = max_dialogue_turns
+        self._max_dialogue_turns: Optional[int] = max_dialogue_turns
         self._default_lock_timeout: float = default_lock_timeout
         self._logger: Optional[IEventLogger] = logger
         self._conversation_locks: dict[tuple[str, ...], asyncio.Lock] = {}
         self._dialogue_turns: dict[tuple[str, ...], int] = {}
         self._last_negotiated_tick: dict[tuple[str, ...], int] = {}
+        self._conversation_summaries: dict[tuple[str, ...], str] = {}
+
+    def get_summary(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> str:
+        pair_key = self._get_pair_key(agent_a_id, agent_b_id)
+        return self._conversation_summaries.get(pair_key, "")
+
+    def set_summary(self, summary: str, agent_a_id: str, agent_b_id: Optional[str] = None) -> None:
+        pair_key = self._get_pair_key(agent_a_id, agent_b_id)
+        self._conversation_summaries[pair_key] = summary
+
+    def is_turn_limit_exceeded(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> bool:
+        if self._max_dialogue_turns is None:
+            return False
+        return self.get_turn_count(agent_a_id, agent_b_id) > self._max_dialogue_turns
+
+    def reset_session(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> None:
+        pair_key = self._get_pair_key(agent_a_id, agent_b_id)
+        self._dialogue_turns.pop(pair_key, None)
+        self._conversation_summaries.pop(pair_key, None)
 
     @property
-    def max_dialogue_turns(self) -> int:
+    def max_dialogue_turns(self) -> Optional[int]:
         return self._max_dialogue_turns
 
     @staticmethod
@@ -91,13 +110,6 @@ class DialogueSessionManager:
     def get_turn_count(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> int:
         pair_key = self._get_pair_key(agent_a_id, agent_b_id)
         return self._dialogue_turns.get(pair_key, 0)
-
-    def is_turn_limit_exceeded(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> bool:
-        return self.get_turn_count(agent_a_id, agent_b_id) > self._max_dialogue_turns
-
-    def reset_session(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> None:
-        pair_key = self._get_pair_key(agent_a_id, agent_b_id)
-        self._dialogue_turns.pop(pair_key, None)
 
     def mark_negotiated(self, agent_a_id: str, agent_b_id: Optional[str] = None, tick: int = 0) -> None:
         pair_key = self._get_pair_key(agent_a_id, agent_b_id)

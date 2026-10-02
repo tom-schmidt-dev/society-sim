@@ -183,3 +183,49 @@ async def test_conflict_fallback_on_cognition_failure(conflict_setup) -> None:
     # Event 'cognition_failed' wurde geloggt
     logged_event_types = [call.args[0].event_type for call in logger.log.call_args_list]
     assert "cognition_failed" in logged_event_types
+
+@pytest.mark.asyncio
+async def test_corridor_encounter_delegates_to_llm_when_deterministic_fsm_disabled(conflict_setup) -> None:
+    # TC-CON-05: Bei enable_deterministic_corridor=False wird die FSM umgangen und das LLM befragt
+    coordinator, cognition, logger, _ = conflict_setup
+    coordinator._enable_deterministic_corridor = False
+
+    alice = Agent(id="1", name="Alice", position=Position(5, 5), is_conversational=True)
+    alice.assign_path([Position(6, 5)])
+    alice.push_goal(Goal(name="Ost-Tor", target_position=Position(10, 5)))
+
+    bob = Agent(id="2", name="Bob", position=Position(6, 5), is_conversational=True)
+    bob.assign_path([Position(5, 5)])
+    bob.push_goal(Goal(name="West-Tor", target_position=Position(1, 5)))
+
+    # Wände direkt in den mentalen Karten der Agenten als Hindernisse markieren
+    alice.mental_map.mark_obstacle(Position(5, 4), 1)
+    alice.mental_map.mark_obstacle(Position(6, 4), 1)
+    bob.mental_map.mark_obstacle(Position(5, 4), 1)
+    bob.mental_map.mark_obstacle(Position(6, 4), 1)
+
+    all_entities = [alice, bob]
+
+    cognition.resolve_blockage.return_value = BlockedResolution(
+        thought="Wir stehen uns im Weg. Ich bitte Bob, zur Seite zu treten.",
+        action=TalkAction(
+            target_agent_id="2",
+            message="Hier ist es eng, kannst du bitte Platz machen?",
+            reason="Passage aushandeln",
+            intent="request_yield",
+        ),
+    )
+
+    await coordinator.resolve_blockage(
+        agent=alice,
+        blocker=bob,
+        blocked_pos=Position(6, 5),
+        all_entities=all_entities,
+    )
+
+    cognition.resolve_blockage.assert_awaited_once()
+    context = cognition.resolve_blockage.call_args[0][0]
+    assert context["allow_talk"] is True
+    assert context["blocker_id"] == "2"
+    assert alice.is_waiting_for_reply is True
+    assert alice.interaction_partner_id == "2"

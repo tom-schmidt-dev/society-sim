@@ -617,11 +617,14 @@ class ActionExecutor:
                 else:
                     msg = self.create_talk_message(agent, action.message, channel=CommunicationChannel.LOCAL_TALK, intent=action.intent)
                     delivered = self.dispatch_message(agent, target, msg, incident_id)
-                    if delivered and action.intent not in ("accept", "offer_yield"):
-                        agent.is_waiting_for_reply = True
-                        agent.interaction_partner_id = target.id
-                        if isinstance(target, Agent):
-                            target.interaction_partner_id = agent.id
+                    if delivered:
+                        if action.intent in ("accept", "offer_yield"):
+                            agent.is_waiting_for_reply = False
+                        else:
+                            agent.is_waiting_for_reply = True
+                            agent.interaction_partner_id = target.id
+                            if isinstance(target, Agent):
+                                target.interaction_partner_id = agent.id
 
     def execute_consume(
         self,
@@ -739,19 +742,26 @@ class ActionExecutor:
         self._need_service.satisfy_need(agent, "energy", reduction=effective_reduction)
 
         target_name = target_entity.name if target_entity else "vor Ort"
+        target_id = target_entity.id if target_entity else None
+        target_pos = (
+            (target_entity.position.x, target_entity.position.y)
+            if target_entity
+            else (agent.position.x, agent.position.y)
+        )
+
         self._logger.log(
             SimulationEvent(
                 tick=current_tick,
                 agent_id=agent.id,
-                event_type="entity_drank",
-                summary=f"Agent {agent.name} trinkt an '{target_entity.name}' (Hydration: {hydration}). Durst sinkt auf {agent.needs.get('thirst', 0.0):.2f}.",
+                event_type="entity_rested",
+                summary=f"Agent {agent.name} erholt sich ({target_name}, Erholung: {effective_reduction}). Energiebedarf sinkt auf {agent.needs.get('energy', 0.0):.2f}.",
                 payload={
                     "incident_id": incident_id,
-                    "target_entity_id": target_entity.id,
-                    "target_entity_name": target_entity.name,
-                    "hydration_value": hydration,
-                    "remaining_thirst": agent.needs.get("thirst", 0.0),
-                    "position": (target_entity.position.x, target_entity.position.y),
+                    "target_entity_id": target_id,
+                    "target_entity_name": target_name,
+                    "energy_recovery_value": effective_reduction,
+                    "remaining_energy_need": agent.needs.get("energy", 0.0),
+                    "position": target_pos,
                 },
             )
         )

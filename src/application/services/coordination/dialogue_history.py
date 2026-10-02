@@ -62,6 +62,8 @@ class DialogueHistory:
             formatted.append(line)
         return formatted
 
+
+
     def get_unresolved_rejections(self, agent_a_id: str, agent_b_id: str) -> list[DialogueRecord]:
         """Ermittelt abgewiesene Verhandlungen zwischen zwei Entitäten zur Kontextinjektion."""
         pair = {agent_a_id, agent_b_id}
@@ -72,3 +74,27 @@ class DialogueHistory:
 
     def clear(self) -> None:
         self._records.clear()
+
+    def get_recent_records_for_pair(
+            self, agent_a_id: str, agent_b_id: str, limit: int = 20
+    ) -> list[DialogueRecord]:
+        pair = {agent_a_id, agent_b_id}
+        matching = [
+            r for r in self._records
+            if {r.sender_id, r.recipient_id} == pair
+        ]
+        return matching[-limit:] if limit > 0 else []
+
+
+    def get_recent_formatted_for_pair(
+            self, agent_a_id: str, agent_b_id: str, limit: int = 20
+    ) -> list[str]:
+        records = self.get_recent_records_for_pair(agent_a_id, agent_b_id, limit=limit)
+        formatted: list[str] = []
+        for record in records:
+            line = record.format_for_display()
+            if record.intent == "reject":
+                line = f"[ABGELEHNT] {line}"
+            formatted.append(line)
+        return formatted
+

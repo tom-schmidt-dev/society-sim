@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Callable, Optional
 from src.application.services.execution.action_executor import ActionExecutor
@@ -21,6 +22,7 @@ from src.domain.ports.dialogue_coordinator import IDialogueCoordinator
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.vector_memory_store import IVectorMemoryStore
+from src.domain.services.affect_service import AffectService
 
 
 class DialogueCoordinator(IDialogueCoordinator):
@@ -36,6 +38,8 @@ class DialogueCoordinator(IDialogueCoordinator):
         dialogue_history: DialogueHistory,
         tick_provider: Optional[Callable[[], int]] = None,
         vector_memory_store: Optional[IVectorMemoryStore] = None,
+        max_context_dialogues: int = 20,
+        affect_service: Optional[AffectService] = None,
     ) -> None:
         self._logger = logger
         self._cognition_provider = cognition_provider
@@ -47,9 +51,11 @@ class DialogueCoordinator(IDialogueCoordinator):
         self._dialogue_history = dialogue_history
         self._tick_provider = tick_provider or (lambda: 0)
         self._vector_memory_store = vector_memory_store
+        self._max_context_dialogues = max_context_dialogues
+        self._affect_service = affect_service or AffectService()
 
     def _retrieve_social_memories(
-            self, agent_id: str, partner_id: Optional[str]
+        self, agent_id: str, partner_id: Optional[str]
     ) -> list[str]:
         """Ruft Vergangenheitserfahrungen über den Interaktionspartner resilient ab."""
         if not self._vector_memory_store or not partner_id:
@@ -66,6 +72,97 @@ class DialogueCoordinator(IDialogueCoordinator):
         except Exception:
             return []
 
+    async def _synthesize_and_store_social_reflection(
+        self,
+        agent: Agent,
+        partner: Optional[WorldEntity],
+        incident_id: str,
+        current_tick: int,
+        recent_dialogues: list[str],
+    ) -> None:
+        """
+        HINWEIS ZUR ARCHITEKTUR / PERFORMANCE:
+        Die Vektorisierung und Meinungsbildung erfolgt aktuell unmittelbar am Tag nach Gesprächsende.
+        Falls die zusätzliche LLM-Inferenz und das Schreiben in ChromaDB den Echtzeitfluss der
+        Darstellungsschicht (ConsolePresenter / FrameBufferService) beeinträchtigen, kann diese
+        Vektorisierung modular in die nächtliche Konsolidierungsphase (MemoryConsolidationService)
+        verlagert werden, indem am Tag lediglich ein flüchtiges Event gepuffert wird.
+        """
+        partner_name = partner.name if partner else "Unbekannt"
+        partner_id = partner.id if partner else "unknown"
+
+        reflection_context = {
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "partner_id": partner_id,
+            "partner_name": partner_name,
+            "recent_dialogues": recent_dialogues,
+        }
+
+        try:
+            start_time = time.perf_counter()
+            reflection = await self._cognition_provider.reflect_on_dialogue(reflection_context)
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        except Exception as err:
+            self._logger.log(
+                SimulationEvent(
+                    tick=current_tick,
+                    agent_id=agent.id,
+                    event_type="social_reflection_failed",
+                    summary=f"Soziale Reflexion für {agent.name} über {partner_name} fehlgeschlagen: {err}",
+                    payload={"incident_id": incident_id, "error": str(err)},
+                )
+            )
+            return
+
+        memory_text = (
+            f"[Soziale Interaktion mit {partner_name}]: {reflection.assessment} "
+            f"Verlauf: {reflection.progression_summary}"
+        )
+
+        # 1. Direkte Vektorisierung
+        if self._vector_memory_store:
+            try:
+                self._vector_memory_store.add_memories(
+                    agent_id=agent.id,
+                    memories=[memory_text],
+                    metadatas=[{
+                        "category": "social",
+                        "partner_id": partner_id,
+                        "tick": current_tick,
+                    }],
+                )
+            except Exception as err:
+                self._logger.log(
+                    SimulationEvent(
+                        tick=current_tick,
+                        agent_id=agent.id,
+                        event_type="vector_memory_failed",
+                        summary=f"Vektorspeicherung für {agent.name} fehlgeschlagen: {err}",
+                        payload={"incident_id": incident_id, "error": str(err)},
+                    )
+                )
+
+        # 2. Strukturiertes Fine-Tuning-Log für SLM
+        self._logger.log(
+            SimulationEvent(
+                tick=current_tick,
+                agent_id=agent.id,
+                event_type="social_reflection_completed",
+                summary=f"Agent {agent.name}: Soziale Reflexion über {partner_name} abgeschlossen.",
+                payload={
+                    "incident_id": incident_id,
+                    "agent_id": agent.id,
+                    "partner_id": partner_id,
+                    "assessment": reflection.assessment,
+                    "progression_summary": reflection.progression_summary,
+                    "persisted_memory": memory_text,
+                    "dialogue_history": recent_dialogues,
+                    "duration_ms": duration_ms,
+                },
+            )
+        )
+
     async def handle_incoming_dialogue(
         self,
         agent: Agent,
@@ -75,11 +172,17 @@ class DialogueCoordinator(IDialogueCoordinator):
         incident_id = f"dlg-t{current_tick}-{agent.id}-{uuid.uuid4().hex[:6]}"
 
         try:
-            agent.commit_staging_messages()
             incoming_messages = agent.drain_inbox(assimilate=True, tick=current_tick)
             received_dicts = [msg.to_dict() for msg in incoming_messages]
 
-            partner_id = incoming_messages[-1].from_agent_id if incoming_messages else None
+            # Relevante Konversationsnachrichten filtern (Protokollsignale ausschließen)
+            dialogue_messages = [
+                m for m in incoming_messages
+                if not (m.is_courtesy or m.is_halt_request or m.is_resume_signal or m.is_evasion_notice or m.is_path_update)
+            ]
+            latest_dialogue_msg = dialogue_messages[-1] if dialogue_messages else (incoming_messages[-1] if incoming_messages else None)
+
+            partner_id = latest_dialogue_msg.from_agent_id if latest_dialogue_msg else None
             partner = next((other for other in all_entities if other.id == partner_id), None)
 
             if partner:
@@ -89,6 +192,23 @@ class DialogueCoordinator(IDialogueCoordinator):
                     pos=partner.position,
                     tick=current_tick,
                 )
+
+            # Gleitendes Fenster und Historie direkt hier aufbauen
+            if partner_id:
+                recent_formatted = self._dialogue_history.get_recent_formatted_for_pair(
+                    agent.id, partner_id, limit=self._max_context_dialogues
+                )
+                recent_structured = [
+                    r.to_dict()
+                    for r in self._dialogue_history.get_recent_records_for_pair(
+                        agent.id, partner_id, limit=self._max_context_dialogues
+                    )
+                ]
+                conversation_summary = self._session_manager.get_summary(agent.id, partner_id)
+            else:
+                recent_formatted = self._dialogue_history.get_recent_formatted(limit=self._max_context_dialogues)
+                recent_structured = self._dialogue_history.get_recent_structured(limit=self._max_context_dialogues)
+                conversation_summary = ""
 
             turn_count = self._session_manager.increment_turn(agent.id, partner_id)
 
@@ -106,12 +226,24 @@ class DialogueCoordinator(IDialogueCoordinator):
                 or (agent_goal is not None and agent_goal.yield_for_agent_id == partner_id)
             )
 
-            latest_intent = incoming_messages[-1].intent if incoming_messages else None
+            latest_intent = latest_dialogue_msg.intent if latest_dialogue_msg else None
 
-            # Terminal-Guard (Agreement Semaphore): Wenn der Agent bereits für den Partner ausweicht
-            # und der Partner dies mit 'accept' bestätigt ("Danke, ich passiere."), ist die Einigung besiegelt.
-            # Es bedarf keiner weiteren Kognitionsanfrage und keiner Antwortnachricht.
+            # Affektwerte aktualisieren und flüchtige Notizen ableiten
+            if partner_id:
+                self._affect_service.record_turn(agent.id, partner_id, incoming_intent=latest_intent)
+                situational_notes = self._affect_service.generate_situational_notes(
+                    agent_id=agent.id,
+                    partner_id=partner_id,
+                    assertiveness=agent.assertiveness,
+                )
+            else:
+                situational_notes = []
+
+            # Terminal-Guard: Wenn der Agent bereits ausweicht und Partner 'accept' bestätigt
             if agent_is_yielding and latest_intent == "accept":
+                await self._synthesize_and_store_social_reflection(
+                    agent, partner, incident_id, current_tick, recent_formatted
+                )
                 self._session_manager.reset_session(agent.id, partner_id)
                 agent.is_waiting_for_reply = False
                 if agent.interaction_partner_id == partner_id:
@@ -154,14 +286,17 @@ class DialogueCoordinator(IDialogueCoordinator):
             context = {
                 "agent_id": agent.id,
                 "name": agent.name,
+                "assertiveness": agent.assertiveness,
+                "charisma": agent.charisma,
                 "partner_id": partner.id if partner else None,
                 "partner_name": partner.name if partner else "Unbekannt",
                 "partner_is_conversational": partner.is_conversational if partner else False,
                 "current_x": agent.position.x,
                 "current_y": agent.position.y,
                 "received_messages": received_dicts,
-                "recent_dialogues": self._dialogue_history.get_recent_formatted(limit=8),
-                "recent_dialogues_structured": self._dialogue_history.get_recent_structured(limit=8),
+                "conversation_summary": conversation_summary,
+                "recent_dialogues": recent_formatted,
+                "recent_dialogues_structured": recent_structured,
                 "active_goal": active_goal.to_dict() if active_goal else None,
                 "goal_stack": [g.to_dict() for g in agent.goals],
                 "dialogue_turn_count": turn_count,
@@ -174,6 +309,7 @@ class DialogueCoordinator(IDialogueCoordinator):
                 "agent_is_yielding": agent_is_yielding,
                 "social_memories": social_memories,
                 "episodic_memories": social_memories,
+                "situational_notes": situational_notes,
             }
 
             if partner_id and self._session_manager.is_turn_limit_exceeded(agent.id, partner_id):
@@ -212,9 +348,7 @@ class DialogueCoordinator(IDialogueCoordinator):
             if isinstance(resolution.action, TalkAction) and chosen_intent:
                 resolution.action.intent = chosen_intent
 
-            # Ausweich-Semaphor / Pre-Dispatch Guard:
-            # Wenn der Partner bereits ausweicht, darf kein konkurrierendes 'offer_yield'
-            # gesendet oder ein eigenes Ausweichziel gesetzt werden.
+            # Pre-Dispatch Guard gegen Doppel-Ausweichen
             if partner_is_yielding:
                 is_offering_evasion = (
                     chosen_intent == "offer_yield"
@@ -238,7 +372,7 @@ class DialogueCoordinator(IDialogueCoordinator):
                         resolution.action.message = "Danke, ich passiere."
                     resolution.new_goal = None
 
-            # Wenn der Agent Verabschiedung ablehnt (reject), Reset beider Seiten
+            # Reset beider Seiten bei Ablehnung von Verabschiedungen
             if chosen_intent == "reject":
                 agent.has_bid_farewell = False
                 agent.peer_bid_farewell = False
@@ -246,10 +380,7 @@ class DialogueCoordinator(IDialogueCoordinator):
                     partner.has_bid_farewell = False
                     partner.peer_bid_farewell = False
 
-            # Terminal-Handshake Guard gegen wechselseitige accept-Schleifen:
-            # Hat der Partner bereits 'accept' gesendet und der Agent wählt ebenfalls 'accept',
-            # ist die Einigung beidseitig final. Es darf keine weitere TalkAction gesendet werden,
-            # die den Partner erneut zu einer Antwort verleiten würde.
+            # Terminal-Handshake Guard gegen accept-Schleifen
             if latest_intent == "accept" and chosen_intent == "accept":
                 if isinstance(resolution.action, TalkAction):
                     self._dialogue_history.record_dialogue(
@@ -269,6 +400,9 @@ class DialogueCoordinator(IDialogueCoordinator):
                         incident_id=incident_id,
                         all_entities=all_entities,
                     )
+                await self._synthesize_and_store_social_reflection(
+                    agent, partner, incident_id, current_tick, recent_formatted
+                )
                 self._session_manager.reset_session(agent.id, partner_id)
                 agent.is_waiting_for_reply = False
                 if agent.interaction_partner_id == partner_id:
@@ -286,7 +420,22 @@ class DialogueCoordinator(IDialogueCoordinator):
                 all_entities=all_entities,
             )
 
-            if (latest_intent == "offer_yield" and chosen_intent == "accept") or (partner_is_yielding and chosen_intent == "accept"):
+            reflection_done = False
+
+            # Einseitige Verabschiedung / EndDialogueAction reflektieren
+            if isinstance(resolution.action, EndDialogueAction):
+                await self._synthesize_and_store_social_reflection(
+                    agent, partner, incident_id, current_tick, recent_formatted
+                )
+                reflection_done = True
+
+            # Einigung durch Angebot und Annahme abschließen
+            if (latest_intent == "offer_yield" and chosen_intent == "accept") or (
+                    partner_is_yielding and chosen_intent == "accept"):
+                if not reflection_done:
+                    await self._synthesize_and_store_social_reflection(
+                        agent, partner, incident_id, current_tick, recent_formatted
+                    )
                 self._session_manager.reset_session(agent.id, partner_id)
                 agent.is_waiting_for_reply = False
                 if agent.interaction_partner_id == partner_id:
@@ -342,4 +491,4 @@ class DialogueCoordinator(IDialogueCoordinator):
                 )
             )
         finally:
-            agent.is_thinking = False
+            agent.set_thinking(False)

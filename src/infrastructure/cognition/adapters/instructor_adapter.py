@@ -11,6 +11,7 @@ from src.domain.models.planning.cognition import (
     DialogueResolution,
     GoalDecision,
     GoalEvaluation,
+    SocialReflection,
 )
 from src.domain.ports.cognition_provider import ICognitionProvider
 from pydantic import BaseModel
@@ -173,14 +174,24 @@ class InstructorCognitionAdapter(ICognitionProvider):
         incoming_intent = context.get("incoming_intent")
         peer_bid_farewell = context.get("peer_bid_farewell", False)
 
+        assertiveness = context.get("assertiveness", 0.5)
+        charisma = context.get("charisma", 0.5)
+        conversation_summary = context.get("conversation_summary", "")
+
+
         prompt_lines = [
             "Du steuerst die Verhandlung eines Agenten bei einer Blockade in einer 2D-Simulation.\n",
             f"Aktuelle Verhandlungsrunde: {turn_count}.",
+            f"Charaktereigenschaften: Durchsetzungsstärke (Assertiveness)={assertiveness:.2f}, Charisma={charisma:.2f}.",
             f"Eigener Weg zur nächsten Nische: {dist_self} Schritte.",
             f"Weg des Partners zur nächsten Nische: {dist_partner} Schritte.",
             f"Empfohlene Rolle laut Geometrie: '{recommended_role}'.",
             f"Letzter eingehender Intent des Partners: '{incoming_intent}'.",
         ]
+
+        if conversation_summary:
+            prompt_lines.append(f"\nBisherige Zusammenfassung des bisherigen Gesprächsverlaufs:\n{conversation_summary}")
+
         social_memories = context.get("social_memories") or context.get("episodic_memories") or []
         if social_memories:
             prompt_lines.append("\nErinnerungen an frühere Interaktionen mit dem Partner:")
@@ -197,16 +208,26 @@ class InstructorCognitionAdapter(ICognitionProvider):
             ])
         else:
             prompt_lines.extend([
+                "\nVerhaltens- und Entscheidungsregeln basierend auf deiner Persönlichkeit:",
+                "- Hohe Durchsetzungsstärke (assertiveness >= 0.7): Beharre auf deinem Vorrang, argumentiere nachdrücklich und nutze 'request_yield' oder 'reject'. Gib nur bei zwingenden Gründen nach.",
+                "- Niedrige Durchsetzungsstärke (assertiveness <= 0.3): Sei kompromissbereit, weiche Konflikten aus und biete eher 'offer_yield' an, wenn eine Lücke nahe ist.",
+                "- Hohes Charisma (charisma >= 0.7): Formuliere überzeugende, diplomatische Argumente statt reiner Befehle.",
                 "\nEntscheidungsregeln für 'negotiation_intent':",
-                "- 'offer_yield': Du bietest an, in die Nische auszuweichen.",
-                "- 'request_yield': Du forderst den Partner auf, auszuweichen.",
-                "- 'accept': Du stimmst dem Vorschlag des Partners zu.",
-                "- 'reject': Du lehnst den Vorschlag ab und machst einen Gegenvorschlag.",
+                "- 'offer_yield': Du bietest an, selbst in eine Nische auszuweichen (nur wenn du nachgeben willst).",
+                "- 'request_yield': Du forderst den Partner auf, Platz zu machen.",
+                "- 'accept': Du nimmst das Ausweichangebot des Partners an und passierst.",
+                "- 'reject': Du lehnst die Forderung des Partners ab, widersprichst oder beharrst auf deiner Position.",
                 "\nKommunikationsregeln:",
-                "- Setze 'negotiation_intent' passend zu deiner Absicht.",
+                "- Setze 'negotiation_intent' konsistent zu deiner Äußerung.",
+                "- Es gibt keine Rundenbeschränkung: Argumentiere, diskutiere oder streite, solange keine Einigung besteht.",
                 "- Wenn eine Einigung erzielt wurde: Wähle 'end_dialogue' mit finaler Bestätigung.",
-                "- Halte die Unterhaltung kurz und zielführend.",
             ])
+
+        situational_notes = context.get("situational_notes", [])
+        if situational_notes:
+            prompt_lines.append("\nAktuelle situative Verfassung / Innere Haltung:")
+            for note in situational_notes:
+                prompt_lines.append(f"- {note}")
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": "\n".join(prompt_lines)},
@@ -216,6 +237,39 @@ class InstructorCognitionAdapter(ICognitionProvider):
         params = self._build_request_params(DialogueResolution, messages)
         resolution: DialogueResolution = await self._client.chat.completions.create(**params)
         return resolution
+
+    async def reflect_on_dialogue(self, context: dict[str, Any]) -> SocialReflection:
+        partner_name = context.get("partner_name", "Unbekannt")
+        recent_dialogues = context.get("recent_dialogues", [])
+
+        system_prompt = (
+            "Du bist das Reflexionsmodul eines autonomen Agenten in einer Gesellschaftssimulation.\n"
+            f"Ein Gespräch mit {partner_name} wurde soeben beendet.\n"
+            "Analysiere den vorliegenden Gesprächsverlauf und erstelle eine prägnante soziale Einschätzung:\n"
+            "1. 'assessment': Beurteile den Charakter und das Verhalten der Person (z. B. dominant, kompromissbereit, stur, kooperativ).\n"
+            "2. 'progression_summary': Fasse in 1-2 kurzen Sätzen zusammen, wie das Gespräch verlaufen ist und wer nachgegeben hat.\n"
+            "Fasse dich kurz und präzise."
+        )
+
+        user_content = (
+                f"Gesprächsverlauf mit {partner_name}:\n"
+                + ("\n".join(recent_dialogues) if recent_dialogues else "Keine Aufzeichnungen vorhanden.")
+        )
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        params = self._build_request_params(SocialReflection, messages)
+        try:
+            reflection: SocialReflection = await self._client.chat.completions.create(**params)
+            return reflection
+        except Exception:
+            return SocialReflection(
+                assessment="Verhalten unauffällig.",
+                progression_summary=f"Gespräch mit {partner_name} abgeschlossen.",
+            )
 
     async def decompose_plan(
             self, context: AgentCognitiveContext
