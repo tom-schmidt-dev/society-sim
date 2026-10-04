@@ -48,7 +48,23 @@ def test_plan_decomposition_enforces_maximum_chain_length():
             ],
         )
 
-
 def test_action_type_rejects_invalid_strings():
     with pytest.raises(ValidationError):
         SubGoalIntent(action_type="invalid_action_name")  # type: ignore[arg-type]
+
+
+def test_goal_initial_wait_tick_retention_and_serialization() -> None:
+    from src.domain.models.planning.goal import Goal
+
+    goal = Goal(name="Warten auf Partner", remaining_ticks=200, initial_wait_tick=42)
+    assert goal.initial_wait_tick == 42
+    serialized = goal.to_dict()
+    assert serialized["initial_wait_tick"] == 42
+
+
+def test_agent_has_no_interaction_queue() -> None:
+    from src.domain.models.agent.agent import Agent
+    from src.domain.models.world.position import Position
+
+    agent = Agent(id="1", name="Alice", position=Position(0, 0))
+    assert not hasattr(agent, "interaction_queue")

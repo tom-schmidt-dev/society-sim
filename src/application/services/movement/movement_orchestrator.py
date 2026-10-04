@@ -91,6 +91,7 @@ class MovementOrchestrator:
             else:
                 self.handle_blocked_agent(agent, entities, background_tasks)
 
+
     def handle_committed_agent_post_move(
         self, agent: Agent, entities: list[WorldEntity]
     ) -> None:
@@ -117,6 +118,7 @@ class MovementOrchestrator:
         agent: Agent,
         entities: list[WorldEntity],
         background_tasks: set[asyncio.Task[Any]],
+        handled_blocked_pairs: Optional[set[frozenset[str]]] = None,
     ) -> None:
         """Initiiert Konfliktauflösung für blockierte Bewegungsschritte."""
         next_pos = agent.path[0]
@@ -131,6 +133,19 @@ class MovementOrchestrator:
                     or (blocker_goal and blocker_goal.yield_for_agent_id == agent.id)
                 ):
                     return
+
+                # Bei frontalem Gegenverkehr startet deterministisch nur einer der beiden Agenten
+                is_mutual = bool(blocker.has_path and blocker.path and blocker.path[0] == agent.position)
+                if is_mutual:
+                    pair = frozenset({agent.id, blocker.id})
+                    if handled_blocked_pairs is not None:
+                        if pair in handled_blocked_pairs:
+                            return
+                        handled_blocked_pairs.add(pair)
+
+                    # Tie-Breaker: Agent mit kleinerer ID initiiert den Kognitionsaufruf
+                    if agent.id > blocker.id:
+                        return
 
                 if self._conflict_coordinator:
                     agent.is_thinking = True

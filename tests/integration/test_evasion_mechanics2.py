@@ -8,13 +8,15 @@ from src.application.services.execution.action_executor import ActionExecutor
 from src.application.services.coordination.conflict_coordinator import ConflictCoordinator
 from src.application.services.coordination.dialogue_history import DialogueHistory
 from src.application.services.coordination.dialogue_session_manager import DialogueSessionManager
+from src.application.services.interaction.interaction_dispatcher import InteractionDispatcher
 from src.application.services.movement.evasion_finder import EvasionFinder
 from src.application.services.cognition.goal_service import GoalService
 from src.application.simulation_engine import SimulationEngine
 from src.domain.models.agent.agent import Agent
+from src.domain.models.communication.message import IncomingMessage
+from src.domain.models.planning.cognition import SocialReflection
 from src.domain.models.planning.events import SimulationEvent
 from src.domain.models.planning.goal import Goal
-from src.domain.models.communication.message import IncomingMessage
 from src.domain.models.world.position import Position
 from src.domain.models.world.world import WorldGrid
 from src.domain.ports.cognition_provider import ICognitionProvider
@@ -40,7 +42,7 @@ class MockEventLogger(IEventLogger):
         self.events.append(event)
 
 
-class DummyPresenter(IPresenter):
+class MockPresenter(IPresenter):
     def render(
         self,
         grid: WorldGrid,
@@ -48,6 +50,7 @@ class DummyPresenter(IPresenter):
         tick: int,
         dialogues: Optional[list[str]] = None,
         known_positions: Optional[set[Position]] = None,
+        snapshots: Optional[list[Any]] = None,
     ) -> None:
         pass
 
@@ -65,6 +68,12 @@ class MockCognitionProvider(ICognitionProvider):
     async def respond_to_dialogue(self, context: dict[str, Any]) -> Any:
         raise NotImplementedError
 
+    async def reflect_on_dialogue(self, context: dict[str, Any]) -> SocialReflection:
+        return SocialReflection(
+            assessment="Mock-Einschätzung",
+            progression_summary="Mock-Zusammenfassung",
+        )
+
 
 def setup_engine() -> tuple[SimulationEngine, WorldGrid, MockEventLogger]:
     grid = WorldGrid(width=90, height=45)
@@ -78,7 +87,7 @@ def setup_engine() -> tuple[SimulationEngine, WorldGrid, MockEventLogger]:
     grid.set_obstacle(Position(46, 20))
 
     pathfinder = AStarPathfinder()
-    presenter = DummyPresenter()
+    presenter = MockPresenter()
     logger = MockEventLogger()
     cognition = MockCognitionProvider()
 
@@ -134,21 +143,24 @@ async def test_junction_halt_and_niche_entry_handshake() -> None:
 
     await engine.process_tick()
     assert alice.position == Position(45, 22)
-    assert alice.active_goal is not None
-    assert alice.active_goal.halt_signaled is True
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.halt_signaled is True
     assert any(m.is_halt_request for m in bob.inbox)
 
     await engine.process_tick()
     assert alice.position == Position(45, 21)
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Nischen-Halt"
-    assert alice.active_goal.is_evasion_hold is True
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.name == "Nischen-Halt"
+    assert alice_goal.is_evasion_hold is True
     assert any(m.is_resume_signal for m in bob.inbox)
 
     await engine.process_tick()
     assert alice.position == Position(45, 21)
-    assert bob.active_goal is not None
-    assert bob.active_goal.name == "West-Tor"
+    bob_goal = bob.active_goal
+    assert bob_goal is not None
+    assert bob_goal.name == "West-Tor"
     assert bob.is_busy is False
 
 
@@ -180,13 +192,15 @@ async def test_clearance_and_courtesy_handshake() -> None:
 
     await engine.process_tick()
     assert bob.position == Position(45, 22)
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Nischen-Halt"
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.name == "Nischen-Halt"
 
     await engine.process_tick()
     assert bob.position == Position(44, 22)
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Nischen-Halt"
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.name == "Nischen-Halt"
 
     await engine.process_tick()
     assert bob.position == Position(43, 22)
@@ -195,8 +209,9 @@ async def test_clearance_and_courtesy_handshake() -> None:
     assert "Danke fürs Platz machen" in courtesy_msgs[0].message
 
     await engine.process_tick()
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Ost-Tor"
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.name == "Ost-Tor"
     assert alice.has_path is True
     assert alice.path[0] == Position(45, 22)
 
@@ -270,8 +285,9 @@ async def test_farewell_message_does_not_spawn_dialogue_or_evasion() -> None:
     await engine.process_tick()
 
     assert len(alice.inbox) == 0
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Hauptziel"
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.name == "Hauptziel"
     assert alice.is_thinking is False
     assert not any("In Nische ausweichen" in g.name for g in alice.goals)
 
@@ -307,6 +323,7 @@ async def test_evasion_suppressed_when_partner_already_yielding() -> None:
     evasion_finder = EvasionFinder(pathfinder)
     session_manager = DialogueSessionManager()
     executor = ActionExecutor(grid, logger, history, goal_service, pathfinder, evasion_finder=evasion_finder)
+    dispatcher = InteractionDispatcher(logger=logger)
 
     coordinator = ConflictCoordinator(
         logger=logger,
@@ -315,6 +332,7 @@ async def test_evasion_suppressed_when_partner_already_yielding() -> None:
         goal_service=goal_service,
         evasion_finder=evasion_finder,
         action_executor=executor,
+        interaction_dispatcher=dispatcher,
         session_manager=session_manager,
         dialogue_history=history,
     )
@@ -326,6 +344,7 @@ async def test_evasion_suppressed_when_partner_already_yielding() -> None:
         all_entities=[alice, bob],
     )
 
-    assert alice.active_goal is not None
-    assert alice.active_goal.name == "Hauptziel"
+    alice_goal = alice.active_goal
+    assert alice_goal is not None
+    assert alice_goal.name == "Hauptziel"
     assert not any("In Nische ausweichen" in g.name for g in alice.goals)

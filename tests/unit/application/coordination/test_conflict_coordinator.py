@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 from src.application.services.execution.action_executor import ActionExecutor
+from src.application.services.interaction.interaction_dispatcher import InteractionDispatcher
 from src.application.services.coordination.conflict_coordinator import ConflictCoordinator
 from src.application.services.coordination.dialogue_history import DialogueHistory
 from src.application.services.coordination.dialogue_session_manager import DialogueSessionManager
@@ -50,6 +51,8 @@ def conflict_setup():
         tick_provider=lambda: current_tick,
     )
 
+    dispatcher = InteractionDispatcher(logger=logger, tick_provider=lambda: current_tick)
+
     coordinator = ConflictCoordinator(
         logger=logger,
         cognition_provider=cognition,
@@ -57,6 +60,7 @@ def conflict_setup():
         goal_service=goal_service,
         evasion_finder=evasion_finder,
         action_executor=executor,
+        interaction_dispatcher=dispatcher,
         session_manager=session_manager,
         dialogue_history=dialogue_history,
         tick_provider=lambda: current_tick,

@@ -10,11 +10,19 @@ from src.application.services.coordination.dialogue_session_manager import Dialo
 from src.application.services.movement.evasion_finder import EvasionFinder
 from src.application.services.cognition.goal_service import GoalService
 from src.application.services.movement.target_search_service import TargetSearchService
+from src.application.services.interaction.interaction_dispatcher import InteractionDispatcher
 from src.application.simulation_engine import SimulationEngine
 from src.domain.models.agent.agent import Agent
-from src.domain.models.planning.cognition import GoalEvaluation
+from src.domain.models.agent.agent_state import AgentLifecycleState
+from src.domain.models.interaction.commands import TalkCommand
+from src.domain.models.planning.cognition import (
+    BlockedResolution,
+    DialogueResolution,
+    EndDialogueAction,
+    GoalEvaluation,
+    WaitAction,
+)
 from src.domain.models.planning.goal import ExecutionPriority, Goal
-from src.domain.models.communication.interaction_request import InteractionRequest
 from src.domain.models.agent.mental_map import AgentMentalMap
 from src.domain.models.communication.message import IncomingMessage
 from src.domain.models.world.position import Position
@@ -237,7 +245,8 @@ class TestAuditoryRadiusAndFarewellHandshake:
 
     @pytest.mark.asyncio
     async def test_mutual_farewell_handshake_unlocks_both_agents(
-        self, mock_pathfinder: MagicMock, mock_presenter: MagicMock, mock_logger: MagicMock, mock_cognition: AsyncMock
+            self, mock_pathfinder: MagicMock, mock_presenter: MagicMock, mock_logger: MagicMock,
+            mock_cognition: AsyncMock
     ) -> None:
         grid = WorldGrid(width=30, height=30)
         engine = SimulationEngine(
@@ -256,22 +265,35 @@ class TestAuditoryRadiusAndFarewellHandshake:
         engine.register_agent(bob)
 
         alice.interaction_partner_id = "2"
-        alice.has_bid_farewell = True
-        alice.is_waiting_for_reply = True
+        alice.transition_to(AgentLifecycleState.WAITING_FOR_PEER)
 
         bob.interaction_partner_id = "1"
-        bob.has_bid_farewell = True
-        bob.is_waiting_for_reply = True
+        bob.receive_message(
+            IncomingMessage(
+                from_agent_id="1",
+                from_agent_name="Alice",
+                message="Tschüss!",
+                is_farewell=True,
+            )
+        )
+
+        mock_cognition.respond_to_dialogue.return_value = DialogueResolution(
+            thought="Verabschiedung erwidert",
+            action=EndDialogueAction(
+                reason="Verabschiedung erwidert",
+                final_message="Auf Wiedersehen!",
+            ),
+        )
 
         await engine.process_tick()
 
-        assert not alice.has_bid_farewell
         assert not alice.is_waiting_for_reply
         assert alice.interaction_partner_id is None
+        assert alice.lifecycle_state == AgentLifecycleState.IDLE
 
-        assert not bob.has_bid_farewell
         assert not bob.is_waiting_for_reply
         assert bob.interaction_partner_id is None
+        assert bob.lifecycle_state == AgentLifecycleState.IDLE
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +304,13 @@ class TestInteractionQueueMechanics:
     async def test_conflict_coordinator_queues_request_if_blocker_is_busy(
         self, mock_pathfinder: MagicMock, mock_logger: MagicMock, mock_cognition: AsyncMock
     ) -> None:
+        """Prüft, dass bei beschäftigtem Blocker autonomes Warten über Zeiteinheiten statt Queues greift."""
         grid = WorldGrid(width=30, height=30)
         dialogue_history = DialogueHistory()
         session_manager = DialogueSessionManager()
         goal_service = GoalService(mock_logger, mock_cognition, mock_pathfinder)
         evasion_finder = EvasionFinder(mock_pathfinder)
+        dispatcher = InteractionDispatcher(logger=mock_logger)
         action_executor = ActionExecutor(
             grid, mock_logger, dialogue_history, goal_service, mock_pathfinder, evasion_finder=evasion_finder
         )
@@ -298,29 +322,36 @@ class TestInteractionQueueMechanics:
             goal_service=goal_service,
             evasion_finder=evasion_finder,
             action_executor=action_executor,
+            interaction_dispatcher=dispatcher,
             session_manager=session_manager,
             dialogue_history=dialogue_history,
+            enable_deterministic_corridor=False,
         )
 
         alice = Agent(id="1", name="Alice", position=Position(10, 10))
-        alice.path = [Position(11, 10)]
+        alice.assign_path([Position(11, 10)])
+        alice.push_goal(Goal(name="Hauptziel", target_position=Position(15, 10)))
 
         bob = Agent(id="2", name="Bob", position=Position(11, 10))
-        bob.is_thinking = True  # Macht Bob busy
+        bob.interaction_partner_id = "3"  # Bob ist fremdbeschäftigt
+
+        mock_cognition.resolve_blockage.return_value = BlockedResolution(
+            thought="Bob ist beschäftigt, ich warte.",
+            action=WaitAction(ticks=2, reason="Partner beschäftigt"),
+        )
 
         await coordinator.resolve_blockage(alice, bob, Position(11, 10), [alice, bob])
 
-        assert len(bob.interaction_queue) == 1
-        req = bob.interaction_queue[0]
-        assert req.requester_id == "1"
-        assert req.blocked_pos == Position(11, 10)
-        assert alice.is_waiting_for_reply
-        assert alice.interaction_partner_id == "2"
+        assert alice.active_goal is not None
+        assert alice.active_goal.name == "Warten auf Partner"
+        assert alice.active_goal.yield_for_agent_id == "2"
+        assert alice.lifecycle_state == AgentLifecycleState.IDLE
 
     @pytest.mark.asyncio
     async def test_lazy_validation_drops_stale_queue_entry_when_blocker_cleared(
         self, mock_pathfinder: MagicMock, mock_presenter: MagicMock, mock_logger: MagicMock, mock_cognition: AsyncMock
     ) -> None:
+        """Prüft TOCTOU-Schutz: Räumt der Blocker während Deliberation das Feld, wird die Aktion verworfen."""
         grid = WorldGrid(width=30, height=30)
         engine = SimulationEngine(
             grid=grid,
@@ -329,28 +360,38 @@ class TestInteractionQueueMechanics:
             logger=mock_logger,
             cognition_provider=mock_cognition,
             auditory_radius=3,
+            enable_deterministic_corridor=False,
         )
 
         alice = Agent(id="1", name="Alice", position=Position(10, 10))
-        alice.path = [Position(11, 10)]
-        alice.is_waiting_for_reply = True
+        alice.assign_path([Position(11, 10)])
+        alice.push_goal(Goal(name="Hauptziel", target_position=Position(15, 10)))
 
-        # Bob stand früher bei (11, 10), ist nun aber schon bei (11, 9)
-        bob = Agent(id="2", name="Bob", position=Position(11, 9))
-        bob.interaction_queue.append(
-            InteractionRequest(requester_id="1", target_id="2", blocked_pos=Position(11, 10), tick=1)
-        )
+        bob = Agent(id="2", name="Bob", position=Position(11, 10))
+        bob.interaction_partner_id = "3"
 
         engine.register_agent(alice)
         engine.register_agent(bob)
 
-        await engine.process_tick()
+        async def move_blocker_during_thought(context):
+            bob.position = Position(11, 9)
+            return BlockedResolution(
+                thought="Wollte eigentlich warten.",
+                action=WaitAction(ticks=2, reason="Warten"),
+            )
 
-        # Veraltete Anfrage verworfen, Queue leer, Alice entsperrt
-        assert len(bob.interaction_queue) == 0
-        assert not alice.is_waiting_for_reply
-        assert alice.interaction_partner_id is None
+        mock_cognition.resolve_blockage.side_effect = move_blocker_during_thought
 
+        await engine._conflict_coordinator.resolve_blockage(
+            agent=alice,
+            blocker=bob,
+            blocked_pos=Position(11, 10),
+            all_entities=engine._entities,
+        )
+
+        logged_events = [call_args[0][0].event_type for call_args in mock_logger.log.call_args_list]
+        assert "action_dropped_stale" in logged_events
+        assert alice.active_goal.name == "Hauptziel"
 
 # ---------------------------------------------------------------------------
 # 6. Test-Klasse: Epistemische Zielsuche (TargetSearchService)

@@ -7,7 +7,9 @@ from src.application.services.coordination.dialogue_history import DialogueHisto
 from src.application.services.movement.evasion_finder import EvasionFinder
 from src.application.services.cognition.goal_service import GoalService
 from src.domain.models.agent.agent import Agent
+from src.domain.models.agent.agent_state import AgentLifecycleState
 from src.domain.models.communication.communication_templates import DialogueTemplates
+from src.domain.models.interaction.interaction_result import ImmediateResult
 from src.domain.models.planning.events import SimulationEvent
 from src.domain.models.coordination.evasion_phase import EvasionPhase
 from src.domain.models.planning.goal import ExecutionPriority, Goal
@@ -59,7 +61,7 @@ class AgentProtocolService:
             self.verify_dialogue_distance(agent, entities)
             self.handle_farewell_handshake(agent, agents)
             self.process_agent_inbox(agent, entities, agents, background_tasks)
-            self.process_interaction_queue(agent, entities, background_tasks)
+            self.check_waiting_partner_fast_path(agent, entities)
 
     def verify_dialogue_distance(self, agent: Agent, entities: list[WorldEntity]) -> None:
         if not agent.interaction_partner_id:
@@ -70,9 +72,9 @@ class AgentProtocolService:
             if dist > self._auditory_radius:
                 agent.is_waiting_for_reply = False
                 agent.is_listening_to_peer = False
-                agent.has_bid_farewell = False
-                agent.peer_bid_farewell = False
                 agent.interaction_partner_id = None
+                if agent.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                    agent.transition_to(AgentLifecycleState.IDLE)
                 self._logger.log(
                     SimulationEvent(
                         tick=self._tick_provider(),
@@ -84,25 +86,8 @@ class AgentProtocolService:
                 )
 
     def handle_farewell_handshake(self, agent: Agent, agents: list[Agent]) -> None:
-        if not (agent.has_bid_farewell and agent.interaction_partner_id):
-            return
-        partner = next((a for a in agents if a.id == agent.interaction_partner_id), None)
-        if isinstance(partner, Agent) and partner.has_bid_farewell:
-            self._logger.log(
-                SimulationEvent(
-                    tick=self._tick_provider(),
-                    agent_id=agent.id,
-                    event_type="farewell_handshake_completed",
-                    summary=f"Verabschiedung zwischen {agent.name} und {partner.name} abgeschlossen.",
-                    payload={"partner_id": partner.id},
-                )
-            )
-            for a in (agent, partner):
-                a.has_bid_farewell = False
-                a.peer_bid_farewell = False
-                a.is_listening_to_peer = False
-                a.is_waiting_for_reply = False
-                a.interaction_partner_id = None
+        """Legacy-Hook für Verabschiedung; Zustände werden über FSM/IDLE abgebildet."""
+        pass
 
     def process_agent_inbox(
         self,
@@ -111,7 +96,7 @@ class AgentProtocolService:
         agents: list[Agent],
         background_tasks: set[asyncio.Task[Any]],
     ) -> None:
-        if not agent.inbox or agent.is_thinking:
+        if not agent.inbox:
             return
 
         current_tick = self._tick_provider()
@@ -153,10 +138,14 @@ class AgentProtocolService:
                 agent.assimilate_message(msg, tick=current_tick)
                 sender = next((a for a in agents if a.id == msg.from_agent_id), None)
                 if isinstance(sender, Agent):
-                    sender.has_bid_farewell = False
-                    sender.peer_bid_farewell = False
                     sender.is_waiting_for_reply = False
                     sender.interaction_partner_id = None
+                    if sender.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                        sender.transition_to(AgentLifecycleState.IDLE)
+                    for cmd, fut in list(sender.interaction_mailbox):
+                        if cmd.source_entity_id == agent.id and not fut.done():
+                            fut.set_result(ImmediateResult(success=True, reason="FAREWELL_COMPLETED"))
+                    sender.interaction_mailbox = [(c, f) for c, f in sender.interaction_mailbox if not f.done()]
 
         # 7. Asynchroner Dialogstart
         if agent.inbox and self._dialogue_coordinator:
@@ -187,6 +176,8 @@ class AgentProtocolService:
         )
         agent.is_evasion_locked = False
         agent.evasion_phase = EvasionPhase.EGRESS
+        if agent.lifecycle_state == AgentLifecycleState.YIELDING:
+            agent.transition_to(AgentLifecycleState.IDLE)
         self._logger.log(
             SimulationEvent(
                 tick=current_tick,
@@ -283,8 +274,6 @@ class AgentProtocolService:
     def _handle_evasion_notice(self, agent: Agent, msg: Any) -> None:
         current_tick = self._tick_provider()
         agent.is_waiting_for_reply = False
-        agent.has_bid_farewell = False
-        agent.peer_bid_farewell = False
         if agent.interaction_partner_id == msg.from_agent_id:
             agent.interaction_partner_id = None
 
@@ -298,108 +287,51 @@ class AgentProtocolService:
         ):
             self._goal_service.pop_goal(agent, target_goal=current_goal)
 
-    def process_interaction_queue(
-        self,
-        agent: Agent,
-        entities: list[WorldEntity],
-        background_tasks: set[asyncio.Task[Any]],
+    def check_waiting_partner_fast_path(
+        self, agent: Agent, entities: list[WorldEntity]
     ) -> None:
-        current_tick = self._tick_provider()
-
-        # 1. Wenn der Ziel-Agent denkt, wird die Queue nicht abgearbeitet und die TTL friert ein
-        if agent.is_thinking:
-            for req in agent.interaction_queue:
-                req.freeze_tick(current_tick)
+        """Beendet Warteziele vorzeitig, wenn der Blocker frei wird oder das Feld geräumt hat."""
+        current_goal = agent.active_goal
+        if not current_goal or current_goal.name != "Warten auf Partner" or not current_goal.yield_for_agent_id:
             return
 
-        while not agent.is_busy and agent.interaction_queue:
-            req = agent.interaction_queue[0]
-            requester_entity = next((e for e in entities if e.id == req.requester_id), None)
-            if not isinstance(requester_entity, Agent):
-                agent.interaction_queue.pop(0)
-                continue
+        partner = next((e for e in entities if e.id == current_goal.yield_for_agent_id), None)
+        if partner is None:
+            self._goal_service.pop_goal(agent)
+            return
 
-            requester: Agent = requester_entity
+        partner_cleared = (
+            (agent.has_path and partner.position != agent.path[0])
+            or (not agent.has_path and agent.position.manhattan_distance(partner.position) > 1)
+        )
+        partner_not_busy = (
+            isinstance(partner, Agent)
+            and not partner.is_busy
+            and partner.interaction_partner_id is None
+        )
 
-            # 2. Wenn der anfragende Agent gerade denkt, bleibt die Anfrage unangetastet in der Queue
-            if requester.is_thinking:
-                req.freeze_tick(current_tick)
-                break
-
-            agent.interaction_queue.pop(0)
-
-            if req.is_expired(current_tick):
-                requester.is_waiting_for_reply = False
-                requester.interaction_partner_id = None
-                self._logger.log(
-                    SimulationEvent(
-                        tick=current_tick,
-                        agent_id=agent.id,
-                        event_type="interaction_request_expired",
-                        summary=f"Anfrage von {req.requester_id} an {agent.name} nach {req.ttl_ticks} Ticks verworfen.",
-                        payload={"requester_id": req.requester_id, "tick_created": req.tick},
-                    )
+        if partner_cleared or partner_not_busy:
+            self._logger.log(
+                SimulationEvent(
+                    tick=self._tick_provider(),
+                    agent_id=agent.id,
+                    event_type="wait_interrupted_fast_path",
+                    summary=f"Warteziel für {agent.name} vorzeitig beendet: Partner {partner.name} ist frei oder hat Feld geräumt.",
+                    payload={"partner_id": partner.id},
                 )
-                continue
-
-            requester.is_waiting_for_reply = False
-            requester.interaction_partner_id = None
-
-            dist = agent.position.manhattan_distance(requester.position)
-            is_within_range = dist <= self._auditory_radius
-            is_still_heading_to_pos = requester.has_path and requester.path[0] == req.blocked_pos
-            is_agent_still_at_pos = agent.position == req.blocked_pos
-
-            if is_within_range and is_still_heading_to_pos and is_agent_still_at_pos:
-                self._logger.log(
-                    SimulationEvent(
-                        tick=current_tick,
-                        agent_id=agent.id,
-                        event_type="interaction_dequeued",
-                        summary=f"Agent {agent.name} bearbeitet Anfrage von {requester.name}.",
-                        payload={
-                            "requester_id": requester.id,
-                            "distance": dist,
-                            "blocked_pos": [req.blocked_pos.x, req.blocked_pos.y],
-                        },
-                    )
-                )
-                if self._conflict_coordinator:
-                    requester.set_thinking(True, reason=f"Löst Blockade mit {agent.name}")
-                    task = asyncio.create_task(
-                        self._conflict_coordinator.resolve_blockage(
-                            requester, agent, req.blocked_pos, entities
-                        )
-                    )
-                    background_tasks.add(task)
-                    task.add_done_callback(background_tasks.discard)
-                break
-            else:
-                self._logger.log(
-                    SimulationEvent(
-                        tick=current_tick,
-                        agent_id=agent.id,
-                        event_type="interaction_request_dropped",
-                        summary=f"Anfrage von {requester.name} an {agent.name} verworfen.",
-                        payload={
-                            "requester_id": requester.id,
-                            "is_within_range": is_within_range,
-                            "is_still_heading_to_pos": is_still_heading_to_pos,
-                            "is_agent_still_at_pos": is_agent_still_at_pos,
-                        },
-                    )
-                )
+            )
+            self._goal_service.pop_goal(agent)
 
     def signal_niche_junction_entry(
-            self, agent: Agent, current_goal: Optional[Goal], entities: list[WorldEntity]
+        self, agent: Agent, current_goal: Optional[Goal], entities: list[WorldEntity]
     ) -> None:
         """Signaliert HALT an den Ausweichpartner bei Erreichen des Verzweigungspunkts."""
         if (
-                current_goal is not None
-                and current_goal.junction_position is not None
-                and not current_goal.is_evasion_hold
-                and not current_goal.halt_signaled
-                and agent.position == current_goal.junction_position
+            current_goal is not None
+            and current_goal.junction_position is not None
+            and not current_goal.is_evasion_hold
+            and not current_goal.halt_signaled
+            and agent.position == current_goal.junction_position
         ):
             current_goal.halt_signaled = True
             partner_id = current_goal.yield_for_agent_id
@@ -417,7 +349,7 @@ class AgentProtocolService:
                 )
 
     def handle_niche_arrival(
-            self, agent: Agent, current_goal: Goal, entities: list[WorldEntity]
+        self, agent: Agent, current_goal: Goal, entities: list[WorldEntity]
     ) -> None:
         current_tick = self._tick_provider()
         junction = current_goal.junction_position
@@ -491,8 +423,8 @@ class AgentProtocolService:
                 continue
             other_goal = other.active_goal
             if (
-                    (other.is_evasion_locked or (other_goal and other_goal.is_evasion_hold))
-                    and (other_goal and other_goal.yield_for_agent_id == agent.id)
+                (other.is_evasion_locked or (other_goal and other_goal.is_evasion_hold))
+                and (other_goal and other_goal.yield_for_agent_id == agent.id)
             ):
                 junction = other_goal.junction_position
                 if junction is None:
@@ -504,10 +436,10 @@ class AgentProtocolService:
 
                 active_goal = agent.active_goal
                 is_at_destination = (
-                        active_goal is not None
-                        and active_goal.target_position is not None
-                        and agent.position == active_goal.target_position
-                        and not agent.has_path
+                    active_goal is not None
+                    and active_goal.target_position is not None
+                    and agent.position == active_goal.target_position
+                    and not agent.has_path
                 )
                 is_outside_corridor = not self.is_in_corridor_zone(agent.position)
                 destination_cleared = is_at_destination and is_outside_corridor
@@ -516,6 +448,8 @@ class AgentProtocolService:
                 if (has_margin or destination_cleared) and junction_passed:
                     other_goal.yield_for_agent_id = None
                     agent.evasion_phase = EvasionPhase.CLEARANCE_CONFIRMED
+                    if agent.lifecycle_state == AgentLifecycleState.PASSING:
+                        agent.transition_to(AgentLifecycleState.IDLE)
                     self._logger.log(
                         SimulationEvent(
                             tick=current_tick,

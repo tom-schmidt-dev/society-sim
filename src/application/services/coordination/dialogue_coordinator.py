@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 import uuid
 from typing import Callable, Optional
 from src.application.services.execution.action_executor import ActionExecutor
@@ -9,6 +10,9 @@ from src.application.services.coordination.dialogue_session_manager import Dialo
 from src.application.services.movement.evasion_finder import EvasionFinder
 from src.application.services.cognition.goal_service import GoalService
 from src.domain.models.agent.agent import Agent
+from typing import cast
+from src.domain.models.agent.agent_state import AgentLifecycleState
+from src.domain.models.interaction.interaction_result import ImmediateResult
 from src.domain.models.planning.cognition import (
     DialogueResolution,
     EndDialogueAction,
@@ -164,25 +168,38 @@ class DialogueCoordinator(IDialogueCoordinator):
         )
 
     async def handle_incoming_dialogue(
-        self,
-        agent: Agent,
-        all_entities: list[WorldEntity],
+            self,
+            agent: Agent,
+            all_entities: list[WorldEntity],
     ) -> None:
         current_tick = self._tick_provider()
         incident_id = f"dlg-t{current_tick}-{agent.id}-{uuid.uuid4().hex[:6]}"
+        chosen_intent: Optional[str] = None
 
         try:
+            agent.commit_staging_messages()
             incoming_messages = agent.drain_inbox(assimilate=True, tick=current_tick)
             received_dicts = [msg.to_dict() for msg in incoming_messages]
 
-            # Relevante Konversationsnachrichten filtern (Protokollsignale ausschließen)
             dialogue_messages = [
                 m for m in incoming_messages
-                if not (m.is_courtesy or m.is_halt_request or m.is_resume_signal or m.is_evasion_notice or m.is_path_update)
+                if not (
+                    m.is_courtesy
+                    or m.is_halt_request
+                    or m.is_resume_signal
+                    or m.is_evasion_notice
+                    or m.is_path_update
+                )
             ]
-            latest_dialogue_msg = dialogue_messages[-1] if dialogue_messages else (incoming_messages[-1] if incoming_messages else None)
+            latest_dialogue_msg = dialogue_messages[-1] if dialogue_messages else (
+                incoming_messages[-1] if incoming_messages else None
+            )
 
-            partner_id = latest_dialogue_msg.from_agent_id if latest_dialogue_msg else None
+            partner_id = (
+                latest_dialogue_msg.from_agent_id
+                if latest_dialogue_msg
+                else agent.interaction_partner_id
+            )
             partner = next((other for other in all_entities if other.id == partner_id), None)
 
             if partner:
@@ -193,7 +210,6 @@ class DialogueCoordinator(IDialogueCoordinator):
                     tick=current_tick,
                 )
 
-            # Gleitendes Fenster und Historie direkt hier aufbauen
             if partner_id:
                 recent_formatted = self._dialogue_history.get_recent_formatted_for_pair(
                     agent.id, partner_id, limit=self._max_context_dialogues
@@ -210,25 +226,31 @@ class DialogueCoordinator(IDialogueCoordinator):
                 recent_structured = self._dialogue_history.get_recent_structured(limit=self._max_context_dialogues)
                 conversation_summary = ""
 
-            turn_count = self._session_manager.increment_turn(agent.id, partner_id)
+            turn_count = (
+                self._session_manager.increment_turn(agent.id, partner_id)
+                if partner_id
+                else 0
+            )
 
             partner_goal = partner.active_goal if isinstance(partner, Agent) else None
             partner_is_yielding = (
                 isinstance(partner, Agent)
                 and (
-                    partner.is_evasion_locked
+                    partner.lifecycle_state == AgentLifecycleState.YIELDING
+                    or partner.is_evasion_locked
                     or (partner_goal is not None and partner_goal.yield_for_agent_id == agent.id)
                 )
             )
             agent_goal = agent.active_goal
             agent_is_yielding = (
-                agent.is_evasion_locked
+                agent.lifecycle_state == AgentLifecycleState.YIELDING
+                or agent.is_evasion_locked
                 or (agent_goal is not None and agent_goal.yield_for_agent_id == partner_id)
             )
 
+            agent.set_thinking(True, reason=f"Führt Dialog mit {partner.name if partner else 'Partner'}")
             latest_intent = latest_dialogue_msg.intent if latest_dialogue_msg else None
 
-            # Affektwerte aktualisieren und flüchtige Notizen ableiten
             if partner_id:
                 self._affect_service.record_turn(agent.id, partner_id, incoming_intent=latest_intent)
                 situational_notes = self._affect_service.generate_situational_notes(
@@ -239,12 +261,19 @@ class DialogueCoordinator(IDialogueCoordinator):
             else:
                 situational_notes = []
 
-            # Terminal-Guard: Wenn der Agent bereits ausweicht und Partner 'accept' bestätigt
             if agent_is_yielding and latest_intent == "accept":
                 await self._synthesize_and_store_social_reflection(
                     agent, partner, incident_id, current_tick, recent_formatted
                 )
-                self._session_manager.reset_session(agent.id, partner_id)
+                if partner_id:
+                    for cmd, fut in list(agent.interaction_mailbox):
+                        if cmd.source_entity_id == partner_id and not fut.done():
+                            fut.set_result(ImmediateResult(success=True, reason="DIALOGUE_ENDED"))
+                    agent.interaction_mailbox = [
+                        (c, f) for c, f in agent.interaction_mailbox if not f.done()
+                    ]
+                    self._session_manager.reset_session(agent.id, partner_id)
+
                 agent.is_waiting_for_reply = False
                 if agent.interaction_partner_id == partner_id:
                     agent.interaction_partner_id = None
@@ -304,7 +333,7 @@ class DialogueCoordinator(IDialogueCoordinator):
                 "evasion_distance_partner": len_partner,
                 "recommended_role": recommended_role,
                 "incoming_intent": latest_intent,
-                "peer_bid_farewell": agent.peer_bid_farewell,
+                "peer_bid_farewell": False,
                 "partner_is_yielding": partner_is_yielding,
                 "agent_is_yielding": agent_is_yielding,
                 "social_memories": social_memories,
@@ -312,43 +341,15 @@ class DialogueCoordinator(IDialogueCoordinator):
                 "situational_notes": situational_notes,
             }
 
-            if partner_id and self._session_manager.is_turn_limit_exceeded(agent.id, partner_id):
-                if agent_is_yielding:
-                    resolution: DialogueResolution = DialogueResolution(
-                        thought="Maximale Gesprächsrunden erreicht. Ich weiche bereits wie vereinbart aus.",
-                        action=EndDialogueAction(
-                            reason="Maximale Rundenanzahl überschritten.",
-                            final_message="Die Absprache steht, ich weiche aus.",
-                        ),
-                        negotiation_intent="accept",
-                    )
-                elif recommended_role == "yield" and not partner_is_yielding:
-                    resolution = DialogueResolution(
-                        thought="Maximale Gesprächsrunden erreicht. Schlichter entscheidet: Ich weiche aus.",
-                        action=EndDialogueAction(
-                            reason="Maximale Rundenanzahl überschritten.",
-                            final_message="Wir kommen hier zu keiner Einigung. Ich beende das Gespräch und weiche aus.",
-                        ),
-                        negotiation_intent="accept",
-                        new_goal=GoalIntent(name="In Nische ausweichen", intent_type="evade"),
-                    )
-                else:
-                    resolution = DialogueResolution(
-                        thought="Maximale Gesprächsrunden erreicht. Schlichter entscheidet: Ich passiere.",
-                        action=EndDialogueAction(
-                            reason="Maximale Rundenanzahl überschritten.",
-                            final_message="Wir kommen hier zu keiner Einigung. Ich passiere.",
-                        ),
-                        negotiation_intent="accept",
-                    )
-            else:
-                resolution = await self._cognition_provider.respond_to_dialogue(context)
+            # Autonome Kognitionsentscheidung (kein Zwangsschlichter)
+            resolution = await self._cognition_provider.respond_to_dialogue(context)
 
-            chosen_intent = resolution.negotiation_intent
+            chosen_intent = resolution.negotiation_intent or (
+                resolution.action.intent if isinstance(resolution.action, TalkAction) else None
+            )
             if isinstance(resolution.action, TalkAction) and chosen_intent:
-                resolution.action.intent = chosen_intent
+                resolution.action.intent = cast(Any, chosen_intent)
 
-            # Pre-Dispatch Guard gegen Doppel-Ausweichen
             if partner_is_yielding:
                 is_offering_evasion = (
                     chosen_intent == "offer_yield"
@@ -372,15 +373,56 @@ class DialogueCoordinator(IDialogueCoordinator):
                         resolution.action.message = "Danke, ich passiere."
                     resolution.new_goal = None
 
-            # Reset beider Seiten bei Ablehnung von Verabschiedungen
-            if chosen_intent == "reject":
-                agent.has_bid_farewell = False
-                agent.peer_bid_farewell = False
-                if partner and isinstance(partner, Agent):
-                    partner.has_bid_farewell = False
-                    partner.peer_bid_farewell = False
+            wants_to_evade = (
+                (latest_intent == "request_yield" and chosen_intent == "accept")
+                or chosen_intent == "offer_yield"
+                or (resolution.new_goal is not None and resolution.new_goal.intent_type == "evade")
+            )
 
-            # Terminal-Handshake Guard gegen accept-Schleifen
+            # Rejection-Verarbeitung
+            if (chosen_intent == "reject" or latest_intent == "reject") and not wants_to_evade:
+                self._action_executor.execute_dialogue_action(
+                    agent=agent,
+                    partner=partner,
+                    action=resolution.action,
+                    incident_id=incident_id,
+                    all_entities=all_entities,
+                )
+                if partner and isinstance(partner, Agent):
+                    partner.is_waiting_for_reply = False
+                    partner.interaction_partner_id = None
+                    if partner.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                        partner.transition_to(AgentLifecycleState.IDLE)
+                    for p_cmd, p_fut in list(partner.interaction_mailbox):
+                        if p_cmd.source_entity_id == agent.id and not p_fut.done():
+                            p_fut.set_result(
+                                ImmediateResult(
+                                    success=False,
+                                    reason="REJECTED",
+                                    payload={"intent": chosen_intent},
+                                )
+                            )
+                    partner.interaction_mailbox = [
+                        (c, f) for c, f in partner.interaction_mailbox if not f.done()
+                    ]
+                agent.is_waiting_for_reply = False
+                agent.interaction_partner_id = None
+                if agent.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                    agent.transition_to(AgentLifecycleState.IDLE)
+                for a_cmd, a_fut in list(agent.interaction_mailbox):
+                    if a_cmd.source_entity_id == (partner.id if partner else None) and not a_fut.done():
+                        a_fut.set_result(
+                            ImmediateResult(
+                                success=False,
+                                reason="REJECTED",
+                                payload={"intent": chosen_intent},
+                            )
+                        )
+                agent.interaction_mailbox = [
+                    (c, f) for c, f in agent.interaction_mailbox if not f.done()
+                ]
+                return
+
             if latest_intent == "accept" and chosen_intent == "accept":
                 if isinstance(resolution.action, TalkAction):
                     self._dialogue_history.record_dialogue(
@@ -403,13 +445,16 @@ class DialogueCoordinator(IDialogueCoordinator):
                 await self._synthesize_and_store_social_reflection(
                     agent, partner, incident_id, current_tick, recent_formatted
                 )
-                self._session_manager.reset_session(agent.id, partner_id)
+                if partner_id:
+                    self._session_manager.reset_session(agent.id, partner_id)
                 agent.is_waiting_for_reply = False
                 if agent.interaction_partner_id == partner_id:
                     agent.interaction_partner_id = None
+                if agent.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                    agent.transition_to(AgentLifecycleState.IDLE)
                 return
 
-            if isinstance(resolution.action, EndDialogueAction):
+            if isinstance(resolution.action, EndDialogueAction) and partner_id:
                 self._session_manager.reset_session(agent.id, partner_id)
 
             self._action_executor.execute_dialogue_action(
@@ -420,33 +465,56 @@ class DialogueCoordinator(IDialogueCoordinator):
                 all_entities=all_entities,
             )
 
-            reflection_done = False
+            if partner_id:
+                for cmd, fut in list(agent.interaction_mailbox):
+                    if cmd.source_entity_id == partner_id and not fut.done():
+                        fut.set_result(
+                            ImmediateResult(
+                                success=True,
+                                reason="TALK_REPLY" if isinstance(resolution.action, TalkAction) else "DIALOGUE_ENDED",
+                                payload={
+                                    "message": getattr(
+                                        resolution.action,
+                                        "message",
+                                        getattr(resolution.action, "final_message", ""),
+                                    ),
+                                    "intent": chosen_intent,
+                                },
+                            )
+                        )
+                agent.interaction_mailbox = [
+                    (c, f) for c, f in agent.interaction_mailbox if not f.done()
+                ]
 
-            # Einseitige Verabschiedung / EndDialogueAction reflektieren
-            if isinstance(resolution.action, EndDialogueAction):
-                await self._synthesize_and_store_social_reflection(
-                    agent, partner, incident_id, current_tick, recent_formatted
+                is_dialogue_ending = isinstance(resolution.action, EndDialogueAction)
+                is_agreement_reached = (
+                    (latest_intent == "offer_yield" and chosen_intent == "accept")
+                    or (partner_is_yielding and chosen_intent == "accept")
                 )
-                reflection_done = True
 
-            # Einigung durch Angebot und Annahme abschließen
-            if (latest_intent == "offer_yield" and chosen_intent == "accept") or (
-                    partner_is_yielding and chosen_intent == "accept"):
-                if not reflection_done:
+                if is_dialogue_ending or is_agreement_reached:
                     await self._synthesize_and_store_social_reflection(
                         agent, partner, incident_id, current_tick, recent_formatted
                     )
-                self._session_manager.reset_session(agent.id, partner_id)
-                agent.is_waiting_for_reply = False
-                if agent.interaction_partner_id == partner_id:
-                    agent.interaction_partner_id = None
-                return
 
-            wants_to_evade = (
-                (latest_intent == "request_yield" and chosen_intent == "accept")
-                or chosen_intent == "offer_yield"
-                or (resolution.new_goal is not None and resolution.new_goal.intent_type == "evade")
-            )
+                if is_agreement_reached:
+                    if partner_is_yielding or latest_intent == "offer_yield":
+                        agent.transition_to(AgentLifecycleState.PASSING, reason="Passiere Korridor")
+                    self._session_manager.reset_session(agent.id, partner_id)
+                    agent.is_waiting_for_reply = False
+                    if agent.interaction_partner_id == partner_id:
+                        agent.interaction_partner_id = None
+                    partner_name = partner.name if partner else (partner_id or "Partner")
+                    self._logger.log(
+                        SimulationEvent(
+                            tick=current_tick,
+                            agent_id=agent.id,
+                            event_type="dialogue_agreement_confirmed",
+                            summary=f"Agent {agent.name} schließt Dialog ab: Einigung mit {partner_name} erzielt.",
+                            payload={"incident_id": incident_id, "partner_id": partner_id},
+                        )
+                    )
+                    return
 
             if wants_to_evade:
                 agent.is_waiting_for_reply = False
@@ -478,6 +546,35 @@ class DialogueCoordinator(IDialogueCoordinator):
                         thought=resolution.thought,
                         sub_goal_name=sub_goal_name,
                     )
+                    agent.transition_to(
+                        AgentLifecycleState.YIELDING, reason="In Nische ausweichen"
+                    )
+                return
+
+            if isinstance(resolution.action, EndDialogueAction):
+                agent.is_waiting_for_reply = False
+                if agent.interaction_partner_id == partner_id:
+                    agent.interaction_partner_id = None
+                if agent.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                    agent.transition_to(AgentLifecycleState.IDLE)
+                if partner and isinstance(partner, Agent):
+                    partner.is_waiting_for_reply = False
+                    if partner.interaction_partner_id == agent.id:
+                        partner.interaction_partner_id = None
+                    if partner.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                        partner.transition_to(AgentLifecycleState.IDLE)
+                    for p_cmd, p_fut in list(partner.interaction_mailbox):
+                        if p_cmd.source_entity_id == agent.id and not p_fut.done():
+                            p_fut.set_result(
+                                ImmediateResult(
+                                    success=True,
+                                    reason="DIALOGUE_ENDED",
+                                    payload={"intent": chosen_intent},
+                                )
+                            )
+                    partner.interaction_mailbox = [
+                        (c, f) for c, f in partner.interaction_mailbox if not f.done()
+                    ]
                 return
 
         except Exception as err:

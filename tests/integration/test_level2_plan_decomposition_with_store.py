@@ -6,6 +6,7 @@ import pytest
 
 from src.application.services.cognition.plan_decomposition_service import PlanDecompositionService
 from src.domain.models.agent.agent import Agent
+from src.domain.models.planning.cognition import SocialReflection
 from src.domain.models.planning.planning import (
     ActionType,
     AgentCognitiveContext,
@@ -32,18 +33,24 @@ class Level2VectorStoreStub(IVectorMemoryStore):
         return list(self.memories[:limit])
 
 
-class Level2CognitionStub(ICognitionProvider):
+class MockCognitionProvider(ICognitionProvider):
     async def decide_next_goal(self, context: dict[str, Any]) -> Any:
-        pass
+        raise NotImplementedError
 
     async def resolve_blockage(self, context: dict[str, Any]) -> Any:
-        pass
+        raise NotImplementedError
 
     async def evaluate_goal_status(self, context: dict[str, Any]) -> Any:
-        pass
+        raise NotImplementedError
 
     async def respond_to_dialogue(self, context: dict[str, Any]) -> Any:
-        pass
+        raise NotImplementedError
+
+    async def reflect_on_dialogue(self, context: dict[str, Any]) -> SocialReflection:
+        return SocialReflection(
+            assessment="Mock-Einschätzung",
+            progression_summary="Mock-Zusammenfassung",
+        )
 
     async def decompose_plan(self, context: AgentCognitiveContext) -> PlanDecomposition:
         if context.episodic_memories:
@@ -71,7 +78,7 @@ async def test_plan_decomposition_retrieves_from_store() -> None:
     vector_store.add_memories("a1", ["Tag 1: Apfelbaum bei (6, 5) erfolgreich genutzt."])
 
     service = PlanDecompositionService(
-        cognition_provider=Level2CognitionStub(),
+        cognition_provider=MockCognitionProvider(),
         vector_memory_store=vector_store,
     )
 

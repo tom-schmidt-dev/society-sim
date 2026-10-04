@@ -36,6 +36,8 @@ from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.conflict_coordinator import IConflictCoordinator
 from src.domain.ports.dialogue_coordinator import IDialogueCoordinator
 from src.domain.ports.event_logger import IEventLogger
+from src.domain.ports.interaction_dispatcher import IInteractionDispatcher
+from src.application.services.interaction.interaction_dispatcher import InteractionDispatcher
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
 from src.domain.ports.vector_memory_store import IVectorMemoryStore
@@ -72,12 +74,16 @@ class SimulationEngine:
         movement_orchestrator: Optional[MovementOrchestrator] = None,
         cognition_orchestrator: Optional[CognitionOrchestrator] = None,
         protocol_service: Optional[AgentProtocolService] = None,
-        enable_deterministic_corridor: bool = True,
-        enable_day_night: bool = True,  # Neu: Tag-Nacht-Steuerung umschaltbar
-        memory_consolidation_service: Optional[MemoryConsolidationService] = None,
-        vector_memory_store: Optional[IVectorMemoryStore] = None,
+            enable_deterministic_corridor: bool = True,
+            enable_day_night: bool = True,  # Neu: Tag-Nacht-Steuerung umschaltbar
+            memory_consolidation_service: Optional[MemoryConsolidationService] = None,
+            vector_memory_store: Optional[IVectorMemoryStore] = None,
+            interaction_dispatcher: Optional[IInteractionDispatcher] = None,
     ) -> None:
         self._enable_day_night = enable_day_night
+        self._interaction_dispatcher = interaction_dispatcher or InteractionDispatcher(
+            logger=logger, tick_provider=lambda: self._current_tick
+        )
         """Initialisiert Simulationszustand, Basisdienste sowie Kognitions-, Bewegungs- und Protokoll-Orchestratoren."""
         self._grid: WorldGrid = grid
         self._pathfinder: IPathfinder = pathfinder
@@ -163,6 +169,7 @@ class SimulationEngine:
             goal_service=self._goal_service,
             evasion_finder=self._evasion_finder,
             action_executor=self._action_executor,
+            interaction_dispatcher=self._interaction_dispatcher,
             session_manager=self._session_manager,
             dialogue_history=self._dialogue_history,
             tick_provider=lambda: self._current_tick,
@@ -227,6 +234,11 @@ class SimulationEngine:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
+
+    @property
+    def interaction_dispatcher(self) -> IInteractionDispatcher:
+        """Liefert den zentralen InteractionDispatcher."""
+        return self._interaction_dispatcher
 
     @property
     def latest_cognitive_snapshots(self) -> list[AgentCognitiveSnapshot]:
@@ -428,6 +440,12 @@ class SimulationEngine:
         )
         self._process_agent_communications_and_protocols()
 
+        # Phase-1-Hintergrund-Tasks (Dialoge) vollständig abwarten
+        while self._background_tasks:
+            current_tasks = list(self._background_tasks)
+            self._background_tasks.clear()
+            await asyncio.gather(*current_tasks)
+
         # ==========================================================
         # PHASE 2: Arbitrierung & Physische Bewegung (pausiert bei Nacht)
         # ==========================================================
@@ -438,6 +456,14 @@ class SimulationEngine:
                 delayed_agent_ids=self._delayed_agent_ids,
                 background_tasks=self._background_tasks,
             )
+            # Phase-2-Hintergrund-Tasks (Blockade-Auflösungen) abwarten
+            while self._background_tasks:
+                tasks = list(self._background_tasks)
+                self._background_tasks.clear()
+                await asyncio.gather(*tasks)
+
+            for agent in self._agents:
+                self._process_goal_arrival(agent)
             self._commit_staging_messages()
 
         await asyncio.sleep(0)
@@ -482,7 +508,7 @@ class SimulationEngine:
         - Führt epistemische Zielsuchen durch und prüft Zielankünfte.
         """
         self._delayed_agent_ids = {
-            agent.id for agent in self._agents if agent.inbox and not agent.is_thinking
+            agent.id for agent in self._agents if agent.inbox
         }
         self._protocol_service.process_protocols(
             agents=self._agents,

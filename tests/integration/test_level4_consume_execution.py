@@ -17,7 +17,7 @@ from src.domain.models.world.world_entity import WorldEntity
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.services.precondition_evaluator import PreconditionEvaluator
-from tests.integration.test_level2_plan_decomposition_with_store import Level2CognitionStub
+from tests.integration.test_level2_plan_decomposition_with_store import MockCognitionProvider
 
 
 class SilentLogger(IEventLogger):
@@ -32,7 +32,7 @@ async def test_level4_adjacent_consume_execution() -> None:
     pathfinder = MagicMock(spec=IPathfinder)
     precondition_evaluator = PreconditionEvaluator()
     need_service = NeedService()
-    cognition = Level2CognitionStub()
+    cognition = MockCognitionProvider()
     goal_service = GoalService(logger=logger, cognition_provider=cognition, pathfinder=pathfinder)
 
     action_executor = ActionExecutor(

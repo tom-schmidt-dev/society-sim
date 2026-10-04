@@ -15,7 +15,7 @@ from src.domain.models.world.position import Position
 from src.domain.ports.event_logger import IEventLogger
 from src.domain.ports.pathfinder import IPathfinder
 from tests.integration.test_level2_plan_decomposition_with_store import (
-    Level2CognitionStub,
+    MockCognitionProvider,
     Level2VectorStoreStub,
 )
 
@@ -26,7 +26,7 @@ async def test_cognition_orchestrator_with_plan_decomp_and_vector_store() -> Non
     vector_store = Level2VectorStoreStub()
     vector_store.add_memories("a1", ["Tag 1: Apfelbaum bei (6, 5) erfolgreich genutzt."])
 
-    cognition_provider = Level2CognitionStub()
+    cognition_provider = MockCognitionProvider()
     plan_decomp = PlanDecompositionService(
         cognition_provider=cognition_provider,
         vector_memory_store=vector_store,

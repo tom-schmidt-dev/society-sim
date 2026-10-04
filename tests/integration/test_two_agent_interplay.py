@@ -10,17 +10,19 @@ from src.application.services.coordination.dialogue_history import DialogueHisto
 from src.application.services.coordination.dialogue_session_manager import DialogueSessionManager
 from src.application.services.movement.evasion_finder import EvasionFinder, EvasionResult
 from src.application.services.cognition.goal_service import GoalService
+from src.application.services.interaction.interaction_dispatcher import InteractionDispatcher
 from src.application.simulation_engine import SimulationEngine
 from src.domain.models.agent.agent import Agent
+from src.domain.models.agent.agent_state import AgentLifecycleState
 from src.domain.models.planning.cognition import (
     BlockedResolution,
     DialogueResolution,
     EndDialogueAction,
     GoalIntent,
     TalkAction,
+    WaitAction,
 )
 from src.domain.models.planning.goal import ExecutionPriority, Goal
-from src.domain.models.communication.interaction_request import InteractionRequest
 from src.domain.models.communication.message import IncomingMessage
 from src.domain.models.world.position import Position
 from src.domain.models.world.world import WorldGrid
@@ -82,6 +84,8 @@ def test_env(
         evasion_finder=evasion_finder,
     )
 
+    interaction_dispatcher = InteractionDispatcher(logger=mock_logger)
+
     conflict_coordinator = ConflictCoordinator(
         logger=mock_logger,
         cognition_provider=mock_cognition,
@@ -89,6 +93,7 @@ def test_env(
         goal_service=goal_service,
         evasion_finder=evasion_finder,
         action_executor=action_executor,
+        interaction_dispatcher=interaction_dispatcher,
         session_manager=session_manager,
         dialogue_history=dialogue_history,
         enable_deterministic_corridor=False,
@@ -118,6 +123,7 @@ def test_env(
         perception_service=perception_service,
         auditory_radius=3,
         enable_deterministic_corridor=False,
+        interaction_dispatcher=interaction_dispatcher,
     )
 
     return {
@@ -198,18 +204,19 @@ class TestTwoAgentFullEvasionLifecycle:
         await engine.process_tick()
 
         alice.commit_staging_messages()
-        assert bob.active_goal is not None
-        assert bob.active_goal.name == "In Nische ausweichen"
-        assert bob.active_goal.priority == ExecutionPriority.URGENT
-        bob.active_goal.junction_position = junction_tile
-        bob.active_goal.yield_for_agent_id = alice.id
-        bob.active_goal.target_position = niche_tile
+        evasion_goal = bob.active_goal
+        assert evasion_goal is not None
+        assert evasion_goal.name == "In Nische ausweichen"
+        assert evasion_goal.priority == ExecutionPriority.URGENT
+        evasion_goal.junction_position = junction_tile
+        evasion_goal.yield_for_agent_id = alice.id
+        evasion_goal.target_position = niche_tile
         assert bob.path == niche_path
         assert any(msg.is_evasion_notice for msg in alice.inbox)
 
         # 3. Bob betritt die Junction (30, 12) und sendet Halt-Signal
         bob.position = Position(31, 12)
-        bob.active_goal.halt_signaled = False
+        evasion_goal.halt_signaled = False
         bob.path = [junction_tile, Position(30, 11), Position(30, 10)]
 
         await engine.process_tick()
@@ -225,8 +232,9 @@ class TestTwoAgentFullEvasionLifecycle:
 
         alice.commit_staging_messages()
         assert bob.is_evasion_locked
-        assert bob.active_goal is not None
-        assert bob.active_goal.name == "Nischen-Halt"
+        hold_goal = bob.active_goal
+        assert hold_goal is not None
+        assert hold_goal.name == "Nischen-Halt"
         assert any(msg.is_resume_signal for msg in alice.inbox)
 
         # 5. Alice passiert die Nische & Bob reaktiviert Hauptziel
@@ -244,8 +252,9 @@ class TestTwoAgentFullEvasionLifecycle:
         await engine.process_tick()
 
         assert not bob.is_evasion_locked
-        current_goal_name = getattr(bob.active_goal, "name", None)
-        assert current_goal_name == "West-Tor"
+        resumed_goal = bob.active_goal
+        assert resumed_goal is not None
+        assert resumed_goal.name == "West-Tor"
         assert bob.path == path_back
 
         # 6. Beide Agenten setzen reguläre Bewegung fort
@@ -267,10 +276,8 @@ class TestDialogueNegotiationInteractions:
         engine.register_agent(alice)
         engine.register_agent(bob)
 
-        alice.has_bid_farewell = True
-        alice.is_waiting_for_reply = True
+        alice.transition_to(AgentLifecycleState.WAITING_FOR_PEER)
         alice.interaction_partner_id = "2"
-        bob.peer_bid_farewell = True
         bob.interaction_partner_id = "1"
 
         bob.receive_message(
@@ -295,10 +302,12 @@ class TestDialogueNegotiationInteractions:
 
         await engine.process_tick()
 
-        assert not alice.has_bid_farewell
-        assert not alice.peer_bid_farewell
-        assert not bob.has_bid_farewell
-        assert not bob.peer_bid_farewell
+        assert alice.lifecycle_state == AgentLifecycleState.IDLE
+        assert bob.lifecycle_state == AgentLifecycleState.IDLE
+        assert alice.interaction_partner_id is None
+        assert bob.interaction_partner_id is None
+        assert len(alice.interaction_mailbox) == 0
+        assert len(bob.interaction_mailbox) == 0
 
     @pytest.mark.asyncio
     async def test_mutual_farewell_handshake_clears_all_dialogue_locks(self, test_env: dict) -> None:
@@ -311,12 +320,10 @@ class TestDialogueNegotiationInteractions:
         engine.register_agent(alice)
         engine.register_agent(bob)
 
-        alice.has_bid_farewell = True
-        alice.is_waiting_for_reply = True
+        alice.transition_to(AgentLifecycleState.WAITING_FOR_PEER)
         alice.interaction_partner_id = "2"
-
-        bob.peer_bid_farewell = True
         bob.interaction_partner_id = "1"
+
         bob.receive_message(
             IncomingMessage(
                 from_agent_id="1",
@@ -337,64 +344,79 @@ class TestDialogueNegotiationInteractions:
         await engine.process_tick()
 
         assert not alice.is_busy
-        assert not alice.has_bid_farewell
+        assert alice.lifecycle_state == AgentLifecycleState.IDLE
         assert alice.interaction_partner_id is None
 
         assert not bob.is_busy
-        assert not bob.has_bid_farewell
+        assert bob.lifecycle_state == AgentLifecycleState.IDLE
         assert bob.interaction_partner_id is None
-
 
 class TestInteractionQueueSequentialResolution:
     @pytest.mark.asyncio
-    async def test_queued_agent_is_released_when_blocker_becomes_available(self, test_env: dict) -> None:
+    async def test_busy_partner_triggers_wait_goal_and_fast_path_releases_when_free(self, test_env: dict) -> None:
+        """TC-INT-01: Bei fremdbeschäftigtem Blocker entscheidet die Kognition auf Warten; Fast-Path weckt den Agenten."""
         engine: SimulationEngine = test_env["engine"]
         conflict_coordinator: ConflictCoordinator = test_env["conflict_coordinator"]
+        cognition: AsyncMock = test_env["cognition"]
 
         alice = Agent(id="1", name="Alice", position=Position(10, 12))
-        alice.is_thinking = True
+        alice.transition_to(AgentLifecycleState.DELIBERATING, reason="Denkt nach")
 
         bob = Agent(id="2", name="Bob", position=Position(9, 12))
-        bob.path = [Position(10, 12)]
+        bob.assign_path([Position(10, 12)])
+        bob.push_goal(Goal(name="Hauptziel", target_position=Position(15, 12)))
 
         engine.register_agent(alice)
         engine.register_agent(bob)
+
+        cognition.resolve_blockage.return_value = BlockedResolution(
+            thought="Alice ist beschäftigt, ich warte kurz.",
+            action=WaitAction(ticks=2, reason="Partner beschäftigt"),
+        )
 
         await conflict_coordinator.resolve_blockage(bob, alice, Position(10, 12), [alice, bob])
 
-        assert len(alice.interaction_queue) == 1
-        assert bob.is_waiting_for_reply
-        assert bob.interaction_partner_id == "1"
+        # Bob hat ein Warteziel erhalten, ohne in einer Queue zu hängen
+        wait_goal = bob.active_goal
+        assert wait_goal is not None
+        assert wait_goal.name == "Warten auf Partner"
+        assert wait_goal.yield_for_agent_id == "1"
 
-        alice.is_thinking = False
+        # Alice wird frei und räumt das Feld -> Fast-Path beendet das Warten im nächsten Taktzyklus
+        alice.transition_to(AgentLifecycleState.IDLE)
+        alice.position = Position(10, 13)
         await engine.process_tick()
 
-        assert len(alice.interaction_queue) == 0
-        assert not bob.is_waiting_for_reply
-        assert bob.interaction_partner_id is None
+        resumed_goal = bob.active_goal
+        assert resumed_goal is not None
+        assert resumed_goal.name == "Hauptziel"
 
     @pytest.mark.asyncio
-    async def test_stale_request_in_queue_is_dropped_if_agent_already_rerouted(self, test_env: dict) -> None:
+    async def test_free_partner_binds_to_mailbox_future_and_waiting_state(self, test_env: dict) -> None:
+        """TC-INT-02: Bei freiem Blocker wird ein TalkCommand in die Mailbox übergeben und Bob wartet reaktiv."""
         engine: SimulationEngine = test_env["engine"]
+        conflict_coordinator: ConflictCoordinator = test_env["conflict_coordinator"]
+        cognition: AsyncMock = test_env["cognition"]
 
-        alice = Agent(id="1", name="Alice", position=Position(10, 12))
-        bob = Agent(id="2", name="Bob", position=Position(9, 12))
-        bob.path = [Position(9, 11)]
-        bob.is_waiting_for_reply = True
-        bob.interaction_partner_id = "1"
-
-        alice.interaction_queue.append(
-            InteractionRequest(requester_id="2", target_id="1", blocked_pos=Position(10, 12), tick=1)
-        )
+        alice = Agent(id="1", name="Alice", position=Position(10, 12), is_conversational=True)
+        bob = Agent(id="2", name="Bob", position=Position(9, 12), is_conversational=True)
+        bob.assign_path([Position(10, 12)])
+        bob.push_goal(Goal(name="Hauptziel", target_position=Position(15, 12)))
 
         engine.register_agent(alice)
         engine.register_agent(bob)
 
-        await engine.process_tick()
+        cognition.resolve_blockage.return_value = BlockedResolution(
+            thought="Ich bitte um Durchgang.",
+            action=TalkAction(target_agent_id="1", message="Platz bitte", intent="request_yield"),
+        )
 
-        assert len(alice.interaction_queue) == 0
-        assert not bob.is_waiting_for_reply
+        await conflict_coordinator.resolve_blockage(bob, alice, Position(10, 12), [alice, bob])
 
+        # Bob wartet reaktiv auf Antwort; Alice hat den Befehl in ihrer Mailbox
+        assert bob.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER
+        assert bob.interaction_partner_id == "1"
+        assert len(alice.interaction_mailbox) == 1
 
 class TestDistanceConstraintsAndPreemption:
     @pytest.mark.asyncio
@@ -452,9 +474,10 @@ class TestDistanceConstraintsAndPreemption:
         )
 
         assert coop_goal.status == "paused"
-        assert alice.active_goal is not None
-        assert alice.active_goal.name == "In Nische ausweichen"
-        assert alice.active_goal.priority == ExecutionPriority.URGENT
+        evasion_goal = alice.active_goal
+        assert evasion_goal is not None
+        assert evasion_goal.name == "In Nische ausweichen"
+        assert evasion_goal.priority == ExecutionPriority.URGENT
 
         goal_service.pop_goal(alice)
         goal_service.resume_goal(alice)

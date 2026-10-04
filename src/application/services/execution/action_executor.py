@@ -27,6 +27,7 @@ from src.domain.ports.pathfinder import IPathfinder
 from src.domain.services.perception_service import PerceptionService
 from src.application.services.lifecycle.need_service import NeedService
 from src.domain.services.precondition_evaluator import PreconditionEvaluator
+from src.domain.models.agent.agent_state import AgentLifecycleState
 
 
 class ActionExecutor:
@@ -278,6 +279,8 @@ class ActionExecutor:
             if evasion_res.path:
                 agent.assign_path(evasion_res.path)
 
+            agent.transition_to(AgentLifecycleState.YIELDING, reason=goal_name)
+
             if partner:
                 msg = self.create_talk_message(
                     agent=agent,
@@ -304,6 +307,8 @@ class ActionExecutor:
             )
             if evasion_res.path:
                 agent.assign_path(evasion_res.path)
+
+            agent.transition_to(AgentLifecycleState.YIELDING, reason="Erkunde Terrain")
 
             if partner:
                 msg = self.create_talk_message(
@@ -517,9 +522,16 @@ class ActionExecutor:
                 target_pos = agent.path[-1]
 
             if target_pos:
+                was_walkable = agent.mental_map.is_walkable(blocked_pos)
+                agent.mental_map.mark_obstacle(blocked_pos, tick)
                 new_path = self._pathfinder.find_path(agent.position, target_pos, agent.mental_map)
+                if was_walkable:
+                    agent.mental_map.update_tile(blocked_pos, is_walkable=True, tick=tick)
+
                 if new_path:
                     agent.assign_path(new_path)
+                else:
+                    agent.clear_path()
 
         elif isinstance(action, AbortAction):
             agent.clear_path()
@@ -542,12 +554,12 @@ class ActionExecutor:
         )
 
     def execute_dialogue_action(
-        self,
-        agent: Agent,
-        partner: Optional[WorldEntity],
-        action: TalkAction | EndDialogueAction,
-        incident_id: str,
-        all_entities: list[WorldEntity],
+            self,
+            agent: Agent,
+            partner: Optional[WorldEntity],
+            action: TalkAction | EndDialogueAction,
+            incident_id: str,
+            all_entities: list[WorldEntity],
     ) -> None:
         current_tick = self._tick_provider()
 
@@ -565,10 +577,10 @@ class ActionExecutor:
                 message=final_msg,
             )
 
-            active_goal = agent.active_goal
-            is_evading = active_goal is not None and active_goal.priority == ExecutionPriority.URGENT
-            agent.has_bid_farewell = True
-            agent.is_waiting_for_reply = not is_evading
+            agent.is_waiting_for_reply = False
+            agent.interaction_partner_id = None
+            if agent.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                agent.transition_to(AgentLifecycleState.IDLE)
 
             if partner and partner.is_conversational:
                 farewell_msg = IncomingMessage(
@@ -580,19 +592,11 @@ class ActionExecutor:
                 )
                 self.dispatch_message(agent, partner, farewell_msg, incident_id)
                 if isinstance(partner, Agent):
-                    partner.peer_bid_farewell = True
-                    if partner.has_bid_farewell or is_evading or not partner.interaction_partner_id:
-                        agent.has_bid_farewell = False
-                        agent.peer_bid_farewell = False
-                        agent.is_listening_to_peer = False
-                        agent.is_waiting_for_reply = False
-                        agent.interaction_partner_id = None
-
-                        partner.has_bid_farewell = False
-                        partner.peer_bid_farewell = False
-                        partner.is_listening_to_peer = False
-                        partner.is_waiting_for_reply = False
+                    partner.is_waiting_for_reply = False
+                    if partner.interaction_partner_id == agent.id:
                         partner.interaction_partner_id = None
+                    if partner.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                        partner.transition_to(AgentLifecycleState.IDLE)
 
         elif isinstance(action, TalkAction):
             target = self.find_entity(action.target_agent_id, all_entities) or partner
@@ -615,16 +619,27 @@ class ActionExecutor:
                         agent, target, action.message, incident_id, current_tick
                     )
                 else:
-                    msg = self.create_talk_message(agent, action.message, channel=CommunicationChannel.LOCAL_TALK, intent=action.intent)
+                    msg = self.create_talk_message(
+                        agent, action.message, channel=CommunicationChannel.LOCAL_TALK, intent=action.intent
+                    )
                     delivered = self.dispatch_message(agent, target, msg, incident_id)
                     if delivered:
                         if action.intent in ("accept", "offer_yield"):
                             agent.is_waiting_for_reply = False
+                        elif action.intent == "reject":
+                            agent.is_waiting_for_reply = False
+                            agent.interaction_partner_id = None
+                            if isinstance(target, Agent):
+                                target.interaction_partner_id = None
+                                target.is_waiting_for_reply = False
+                                if target.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER:
+                                    target.transition_to(AgentLifecycleState.IDLE)
                         else:
                             agent.is_waiting_for_reply = True
                             agent.interaction_partner_id = target.id
                             if isinstance(target, Agent):
                                 target.interaction_partner_id = agent.id
+
 
     def execute_consume(
         self,

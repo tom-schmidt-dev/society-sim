@@ -28,19 +28,20 @@ class EvasionFinder:
         return bool(grid.is_walkable(pos))
 
     def find_nearest_evasion_tile(
-        self,
-        start: Position,
-        blocked_pos: Position,
-        grid: Any,
-        occupied_positions: set[Position],
-        partner_trajectory: Optional[Sequence[Position] | set[Position]] = None,
-        search_direction: Optional[tuple[float, float]] = None,
-        allow_frontier: bool = True,
+            self,
+            start: Position,
+            blocked_pos: Position,
+            grid: Any,
+            occupied_positions: set[Position],
+            partner_trajectory: Optional[Sequence[Position] | set[Position]] = None,
+            search_direction: Optional[tuple[float, float]] = None,
+            allow_frontier: bool = True,
     ) -> Optional[EvasionResult]:
         """Ermittelt per 3-Stufen-Kaskade das Ausweichfeld und den Schnittpunkt zur Räumung."""
         trajectory_set = set(partner_trajectory) if partner_trajectory else set()
-        # blocked_pos ist eine reale physische Blockade und darf nicht durchschritten werden
-        physical_obstacles: set[Position] = (set(occupied_positions) | {blocked_pos}) - {start}
+
+        # Nur real belegte Kacheln (occupied_positions) blockieren die Traversierung physisch
+        physical_obstacles: set[Position] = (set(occupied_positions) - {start})
         forbidden_targets: set[Position] = set(occupied_positions) | {blocked_pos} | trajectory_set
 
         queue: list[Position] = [start]
@@ -95,28 +96,36 @@ class EvasionFinder:
 
         return None
 
+    @staticmethod
+    def _sort_frontier_neighbors(
+            neighbor_candidates: list[Position],
+            current: Position,
+            direction_vector: Optional[tuple[float, float]],
+    ) -> list[Position]:
+        if direction_vector is None:
+            return neighbor_candidates
+        vx = float(direction_vector[0])
+        vy = float(direction_vector[1])
+        if vx == 0.0 and vy == 0.0:
+            return neighbor_candidates
+        return sorted(
+            neighbor_candidates,
+            key=lambda nb: (nb.x - current.x) * vx + (nb.y - current.y) * vy,
+            reverse=True,
+        )
+
     def _find_nearest_frontier(
-        self,
-        start: Position,
-        grid: AgentMentalMap,
-        frontier_forbidden: set[Position],
-        direction_vector: Optional[tuple[float, float]] = None,
-        max_depth: int = 15,
+            self,
+            start: Position,
+            grid: AgentMentalMap,
+            frontier_forbidden: set[Position],
+            direction_vector: Optional[tuple[float, float]] = None,
+            max_depth: int = 15,
     ) -> tuple[Optional[Position], dict[Position, Position]]:
         """Findet die nächstgelegene Grenzkachel mit Tiefenbegrenzung und Sektor-Gewichtung."""
         frontier_queue: list[tuple[Position, int]] = [(start, 0)]
         frontier_visited: set[Position] = {start} | frontier_forbidden
         came_from: dict[Position, Position] = {}
-
-        def _sort_neighbors(neighbors: list[Position], current: Position) -> list[Position]:
-            if not direction_vector or direction_vector == (0.0, 0.0):
-                return neighbors
-            vx, vy = direction_vector
-            return sorted(
-                neighbors,
-                key=lambda nb: (nb.x - current.x) * vx + (nb.y - current.y) * vy,
-                reverse=True,
-            )
 
         while frontier_queue:
             curr, depth = frontier_queue.pop(0)
@@ -132,8 +141,10 @@ class EvasionFinder:
             if depth >= max_depth:
                 continue
 
-            neighbors = _sort_neighbors(curr.get_neighbors(), curr)
-            for neighbor in neighbors:
+            sorted_neighbors = self._sort_frontier_neighbors(
+                curr.get_neighbors(), curr, direction_vector
+            )
+            for neighbor in sorted_neighbors:
                 if neighbor not in frontier_visited and grid.is_within_bounds(neighbor):
                     frontier_visited.add(neighbor)
                     if self._is_known_walkable(grid, neighbor):
@@ -185,7 +196,7 @@ class EvasionFinder:
             start=agent_a.position,
             blocked_pos=agent_b.position,
             grid=agent_a.mental_map,
-            occupied_positions=other_occupied,
+            occupied_positions=other_occupied | {agent_b.position},
             partner_trajectory=agent_b.path if agent_b.has_path else None,
             allow_frontier=False,
         )
@@ -194,7 +205,7 @@ class EvasionFinder:
             start=agent_b.position,
             blocked_pos=agent_a.position,
             grid=agent_b.mental_map,
-            occupied_positions=other_occupied,
+            occupied_positions=other_occupied | {agent_a.position},
             partner_trajectory=agent_a.path if agent_a.has_path else None,
             allow_frontier=False,
         )

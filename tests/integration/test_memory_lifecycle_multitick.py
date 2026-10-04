@@ -12,7 +12,7 @@ from src.domain.models.planning.cognition import (
     BlockedResolution,
     DialogueResolution,
     GoalDecision,
-    GoalEvaluation,
+    GoalEvaluation, SocialReflection,
 )
 from src.domain.models.planning.planning import (
     ActionType,
@@ -97,6 +97,12 @@ class DeterministicCognitionStub(ICognitionProvider):
             thought = "Dialog beendet"
         return SimpleDialogue()
 
+    async def reflect_on_dialogue(self, context: dict[str, Any]) -> SocialReflection:
+        return SocialReflection(
+            assessment="Mock-Einschätzung",
+            progression_summary="Mock-Zusammenfassung",
+        )
+
     async def decompose_plan(self, context: AgentCognitiveContext) -> PlanDecomposition:
         # 1. Erinnerungsbasierte Zielplanung (Tag 2: Retrieval aus dem Vektorspeicher)
         if context.episodic_memories:
@@ -152,40 +158,6 @@ class DeterministicCognitionStub(ICognitionProvider):
                 )
             ],
         )
-
-        # 2. Wahrnehmungsbasierte Zielplanung (Tag 1: Entität im Sichtfeld vorhanden)
-        consumable = next((e for e in context.known_entities if e.is_consumable), None)
-        if consumable and consumable.last_known_position:
-            target_pos = (consumable.last_known_position.x, consumable.last_known_position.y)
-            return PlanDecomposition(
-                thought=f"Gesehene Ressource {consumable.name} ansteuern.",
-                primary_goal="Nahrungssuche",
-                sub_goals=[
-                    SubGoalIntent(
-                        action_type=ActionType.MOVE_TO,
-                        target_position=target_pos,
-                        description=f"Gehe zu {consumable.name}",
-                    ),
-                    SubGoalIntent(
-                        action_type=ActionType.CONSUME,
-                        target_entity_id=consumable.entity_id,
-                        description=f"Konsumiere {consumable.name}",
-                    ),
-                ],
-            )
-
-        # 3. Fallback: Erkundung
-        return PlanDecomposition(
-            thought="Keine Ressource bekannt. Erkunde.",
-            primary_goal="Nahrungssuche",
-            sub_goals=[
-                SubGoalIntent(
-                    action_type=ActionType.EXPLORE,
-                    description="Erkunde Terrain",
-                )
-            ],
-        )
-
 
 # ==============================================================================
 # End-to-End Integrationstest

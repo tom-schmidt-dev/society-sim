@@ -10,12 +10,13 @@ from src.application.services.coordination.dialogue_history import DialogueHisto
 from src.application.services.coordination.dialogue_session_manager import DialogueSessionManager
 from src.application.services.movement.evasion_finder import EvasionFinder
 from src.application.services.cognition.goal_service import GoalService
-from src.application.services.movement.multi_agent_niche_packer import MultiAgentNichePacker, NicheConfiguration
+from src.application.services.movement.multi_agent_niche_packer import MultiAgentNichePacker
 from src.domain.models.agent.agent import Agent
+from src.domain.models.agent.agent_state import AgentLifecycleState
+from src.domain.models.interaction.commands import TalkCommand
+from src.domain.models.interaction.interaction_result import ImmediateResult
 from src.domain.models.planning.cognition import (
     BlockedResolution,
-    InspectAction,
-    ProbeAction,
     TalkAction,
 )
 from src.domain.models.communication.communication_templates import DialogueTemplates
@@ -28,6 +29,7 @@ from src.domain.models.world.world_entity import WorldEntity
 from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.conflict_coordinator import IConflictCoordinator
 from src.domain.ports.event_logger import IEventLogger
+from src.domain.ports.interaction_dispatcher import IInteractionDispatcher
 from src.domain.ports.pathfinder import IPathfinder
 
 
@@ -40,6 +42,7 @@ class ConflictCoordinator(IConflictCoordinator):
         goal_service: GoalService,
         evasion_finder: EvasionFinder,
         action_executor: ActionExecutor,
+        interaction_dispatcher: IInteractionDispatcher,
         session_manager: DialogueSessionManager,
         dialogue_history: DialogueHistory,
         tick_provider: Optional[Callable[[], int]] = None,
@@ -54,6 +57,7 @@ class ConflictCoordinator(IConflictCoordinator):
         self._goal_service = goal_service
         self._evasion_finder = evasion_finder
         self._action_executor = action_executor
+        self._interaction_dispatcher = interaction_dispatcher
         self._session_manager = session_manager
         self._dialogue_history = dialogue_history
         self._tick_provider = tick_provider or (lambda: 0)
@@ -62,15 +66,25 @@ class ConflictCoordinator(IConflictCoordinator):
         self._convoy_arbitrator = convoy_arbitrator or ConvoyArbitrator()
         self._enable_deterministic_corridor = enable_deterministic_corridor
 
-    async def resolve_blockage(
+    def _calculate_alternative_path(
             self,
             agent: Agent,
-            blocker: WorldEntity,
             blocked_pos: Position,
-            all_entities: list[WorldEntity],
-    ) -> None:
-        lock = self._session_manager.get_lock(agent.id, blocker.id)
+            target_pos: Position,
+            current_tick: int,
+    ) -> Optional[list[Position]]:
+        temp_map = AgentMentalMap(agent.mental_map.width, agent.mental_map.height)
+        temp_map.tiles = dict(agent.mental_map.tiles)
+        temp_map.mark_obstacle(blocked_pos, current_tick)
+        return self._pathfinder.find_path(agent.position, target_pos, temp_map)
 
+    async def resolve_blockage(
+        self,
+        agent: Agent,
+        blocker: WorldEntity,
+        blocked_pos: Position,
+        all_entities: list[WorldEntity],
+    ) -> None:
         current_tick = self._tick_provider()
         incident_id = f"inc-t{current_tick}-{agent.id}x{blocker.id}-{uuid.uuid4().hex[:6]}"
 
@@ -80,43 +94,20 @@ class ConflictCoordinator(IConflictCoordinator):
                     agent.set_thinking(False)
                     return
 
+                agent.set_thinking(True, reason=f"Löse Blockade mit {blocker.name}")
+
                 # 1. Schnelle Vorabprüfung
                 if not agent.has_path or agent.path[0] != blocked_pos or blocker.position != blocked_pos:
+                    return
+
+                # Idempotenz-Schutz: Mailbox & Inbox vorab gegen Gegenanfragen prüfen
+                if any(cmd.source_entity_id == blocker.id for cmd, _ in agent.interaction_mailbox):
                     return
 
                 if agent.inbox and any(m.from_agent_id == blocker.id for m in agent.inbox):
                     return
 
-                is_busy_with_third_party = (
-                        isinstance(blocker, Agent)
-                        and blocker.interaction_partner_id != agent.id
-                        and (blocker.is_busy or blocker.interaction_partner_id is not None)
-                )
-
-                if is_busy_with_third_party and isinstance(blocker, Agent):
-                    if not any(req.requester_id == agent.id for req in blocker.interaction_queue):
-                        from src.domain.models.communication.interaction_request import InteractionRequest
-                        blocker.interaction_queue.append(
-                            InteractionRequest(
-                                requester_id=agent.id,
-                                target_id=blocker.id,
-                                blocked_pos=blocked_pos,
-                                tick=current_tick,
-                            )
-                        )
-                        agent.is_waiting_for_reply = True
-                        agent.interaction_partner_id = blocker.id
-                        self._logger.log(
-                            SimulationEvent(
-                                tick=current_tick,
-                                agent_id=agent.id,
-                                event_type="interaction_queued",
-                                summary=f"Agent {agent.name} wartet auf {blocker.name} (in Warteschlange eingereiht).",
-                                payload={"target_id": blocker.id, "queue_length": len(blocker.interaction_queue)},
-                            )
-                        )
-                    return
-
+                # 2. Bestehende Ausweichblockaden oder Verhandlungen abfangen
                 if isinstance(blocker, Agent):
                     if self._session_manager.was_negotiated_in_tick(agent.id, blocker.id, current_tick):
                         return
@@ -131,12 +122,17 @@ class ConflictCoordinator(IConflictCoordinator):
 
                     agent_goal = agent.active_goal
                     if (
-                        agent.is_evasion_locked
-                        or (agent_goal is not None and agent_goal.yield_for_agent_id == blocker.id)
-                        or agent.evasion_phase in (EvasionPhase.YIELDING_INGRESS, EvasionPhase.YIELDING_WAIT)
+                            agent.is_evasion_locked
+                            or (
+                            agent_goal is not None
+                            and agent_goal.yield_for_agent_id == blocker.id
+                            and agent_goal.name != "Warten auf Partner"
+                    )
+                            or agent.evasion_phase in (EvasionPhase.YIELDING_INGRESS, EvasionPhase.YIELDING_WAIT)
                     ):
                         return
 
+                # 3. Deterministischer Korridor-Check
                 if isinstance(blocker, Agent) and agent.is_conversational and blocker.is_conversational:
                     if self._enable_deterministic_corridor and self._is_corridor_encounter(agent, blocker, blocked_pos):
                         await self._resolve_corridor_blockage_deterministically(
@@ -149,86 +145,284 @@ class ConflictCoordinator(IConflictCoordinator):
                         )
                         return
 
-                if isinstance(blocker, Agent):
-                    blocker.is_listening_to_peer = True
-                    blocker.interaction_partner_id = agent.id
+                # 4. Reaktive Vorab-Prüfung auf fremdbeschäftigten Blocker (Queue-Ablösung)
+                is_partner = (
+                        isinstance(blocker, Agent)
+                        and blocker.interaction_partner_id == agent.id
+                )
+                is_mutual = (
+                        isinstance(blocker, Agent)
+                        and bool(blocker.path and blocker.path[0] == agent.position)
+                )
 
-                try:
-                    agent.memory.update_entity_perception(
-                        entity_id=blocker.id,
-                        name=blocker.name,
-                        pos=blocker.position,
-                        tick=current_tick,
+                if (
+                        isinstance(blocker, Agent)
+                        and not (is_partner or is_mutual)
+                        and (
+                        blocker.interaction_partner_id not in (None, agent.id)
+                        or blocker.lifecycle_state == AgentLifecycleState.DELIBERATING
+                        or blocker.is_busy
+                )
+                ):
+                    talk_cmd = TalkCommand(
+                        source_entity_id=agent.id,
+                        target_entity_id=blocker.id,
+                        message="Bitte Durchgang freigeben",
+                        intent="request_yield",
                     )
+                    dispatch_res = self._interaction_dispatcher.dispatch(agent, blocker, talk_cmd)
+                    if isinstance(dispatch_res, ImmediateResult) and dispatch_res.reason == "BUSY":
+                        active_goal = agent.active_goal
+                        target_pos = (
+                            active_goal.target_position
+                            if active_goal and active_goal.target_position
+                            else (agent.path[-1] if agent.path else None)
+                        )
+                        alt_path = (
+                            self._calculate_alternative_path(agent, blocked_pos, target_pos, current_tick)
+                            if target_pos
+                            else None
+                        )
 
-                    allow_talk = agent.memory.can_talk(blocker.id)
-                    allow_probe = agent.memory.can_probe(blocker.id)
-                    inspected = agent.memory.is_inspected(blocker.id)
+                        restweg_aktuell_zeiteinheiten = len(agent.path)
+                        alternativweg_gesamt_zeiteinheiten = len(alt_path) if alt_path else None
+                        umweg_mehr_zeiteinheiten = (
+                            (len(alt_path) - len(agent.path)) if alt_path else None
+                        )
+                        active_goal = agent.active_goal
+                        bisher_gewartete_zeiteinheiten = (
+                            (current_tick - active_goal.initial_wait_tick)
+                            if (active_goal and active_goal.initial_wait_tick is not None)
+                            else 0
+                        )
 
-                    fact = agent.memory.known_entities.get(blocker.id)
-                    known_type = fact.entity_type if fact else None
-                    belief = agent.memory.type_beliefs.get(known_type) if known_type else None
-                    empirical_summary = (
-                        f"Kategorie '{known_type}': {belief.empirical_walkability}; {belief.empirical_conversational}"
-                        if belief
-                        else "Keine empirischen Typ-Erfahrungen vorhanden."
-                    )
+                        context = {
+                            "agent_id": agent.id,
+                            "name": agent.name,
+                            "blocker_id": blocker.id,
+                            "blocker_name": blocker.name,
+                            "blocker_busy": True,
+                            "current_pos": [agent.position.x, agent.position.y],
+                            "blocked_pos": [blocked_pos.x, blocked_pos.y],
+                            "active_goal": active_goal.name if active_goal else "Keines",
+                            "bisher_gewartete_zeiteinheiten": bisher_gewartete_zeiteinheiten,
+                            "restweg_aktuell_zeiteinheiten": restweg_aktuell_zeiteinheiten,
+                            "alternativweg_gesamt_zeiteinheiten": alternativweg_gesamt_zeiteinheiten,
+                            "umweg_mehr_zeiteinheiten": umweg_mehr_zeiteinheiten,
+                            "has_alternative_path": alt_path is not None,
+                            "alternative_path_length": alternativweg_gesamt_zeiteinheiten,
+                            "detour_additional_steps": umweg_mehr_zeiteinheiten,
+                            "allow_talk": False,
+                            "can_reroute": alt_path is not None,
+                        }
 
-                    current_goal = agent.active_goal
-                    context = {
-                        "agent_id": agent.id,
-                        "name": agent.name,
-                        "blocker_id": blocker.id,
-                        "blocker_name": blocker.name,
-                        "blocker_inspected": inspected,
-                        "allow_talk": allow_talk,
-                        "allow_probe": allow_probe,
-                        "empirical_record": empirical_summary,
-                        "current_pos": [agent.position.x, agent.position.y],
-                        "blocked_pos": [blocked_pos.x, blocked_pos.y],
-                        "active_goal": current_goal.name if current_goal else "Keines",
-                    }
+                        try:
+                            agent.set_thinking(True, reason="Entscheide über Umweg oder Warten bei besetztem Blocker")
+                            resolution: BlockedResolution = await self._cognition_provider.resolve_blockage(context)
+                        except Exception as err:
+                            self._logger.log(
+                                SimulationEvent(
+                                    tick=current_tick,
+                                    agent_id=agent.id,
+                                    event_type="cognition_failed",
+                                    summary=f"Kognition fehlgeschlagen für {agent.name}: {err}",
+                                    payload={"incident_id": incident_id, "error": str(err)},
+                                )
+                            )
+                            agent.push_goal(
+                                Goal(
+                                    name="Warten (Fallback)",
+                                    holds_position=True,
+                                    remaining_ticks=2,
+                                    priority=ExecutionPriority.URGENT,
+                                    description="Kognitionsfehler Fallback",
+                                )
+                            )
+                            return
+                        finally:
+                            agent.set_thinking(False)
 
-                    try:
-                        start_time = time.perf_counter()
-                        resolution: BlockedResolution = await self._cognition_provider.resolve_blockage(context)
-                        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                    except Exception as err:
+                        # TOCTOU-Validierung nach Deliberation
+                        if blocker.position != blocked_pos:
+                            self._logger.log(
+                                SimulationEvent(
+                                    tick=current_tick,
+                                    agent_id=agent.id,
+                                    event_type="action_dropped_stale",
+                                    summary=f"Aktion für {agent.name} verworfen: Blocker {blocker.name} hat Position ({blocked_pos.x}, {blocked_pos.y}) geräumt.",
+                                    payload={"incident_id": incident_id, "blocker_id": blocker.id},
+                                )
+                            )
+                            return
+
+                        action_type = resolution.action.action_type
+                        if action_type == "reroute":
+                            if alt_path:
+                                agent.assign_path(alt_path)
+                        elif action_type == "wait":
+                            prev_wait = active_goal.initial_wait_tick if active_goal else None
+                            wait_goal = Goal(
+                                name="Warten auf Partner",
+                                holds_position=True,
+                                remaining_ticks=200,
+                                yield_for_agent_id=blocker.id,
+                                initial_wait_tick=prev_wait if prev_wait is not None else current_tick,
+                                description=resolution.thought or "Wartet auf beschäftigten Blocker.",
+                            )
+                            self._goal_service.push_goal(agent, wait_goal, incident_id=incident_id)
+                        elif action_type == "abort":
+                            agent.clear_path()
+                            agent.abandon_active_goal()
+
                         self._logger.log(
                             SimulationEvent(
                                 tick=current_tick,
                                 agent_id=agent.id,
-                                event_type="cognition_failed",
-                                summary=f"Kognition fehlgeschlagen für {agent.name}: {err}",
-                                payload={"incident_id": incident_id, "error": str(err)},
+                                event_type="blockage_resolved",
+                                summary=f"{agent.name} führt {action_type} aus. Grund: {resolution.thought}.",
+                                payload={
+                                    "incident_id": incident_id,
+                                    "action": action_type,
+                                    "internal_thought": resolution.thought,
+                                },
                             )
                         )
-                        from src.domain.models.planning.goal import ExecutionPriority
-                        fallback_goal = Goal(
+                        return
+
+                # 5. Kognitions- & Inspektionspfad für freie Partner und statische Entitäten
+                agent.memory.update_entity_perception(
+                    entity_id=blocker.id,
+                    name=blocker.name,
+                    pos=blocker.position,
+                    tick=current_tick,
+                )
+
+                allow_talk = agent.memory.can_talk(blocker.id)
+                allow_probe = agent.memory.can_probe(blocker.id)
+                inspected = agent.memory.is_inspected(blocker.id)
+
+                fact = agent.memory.known_entities.get(blocker.id)
+                known_type = fact.entity_type if fact else None
+                belief = agent.memory.type_beliefs.get(known_type) if known_type else None
+                empirical_summary = (
+                    f"Kategorie '{known_type}': {belief.empirical_walkability}; {belief.empirical_conversational}"
+                    if belief
+                    else "Keine empirischen Typ-Erfahrungen vorhanden."
+                )
+
+                current_goal = agent.active_goal
+                target_pos = (
+                    current_goal.target_position
+                    if (current_goal and current_goal.target_position)
+                    else (agent.path[-1] if agent.path else None)
+                )
+                alt_path = (
+                    self._calculate_alternative_path(agent, blocked_pos, target_pos, current_tick)
+                    if target_pos
+                    else None
+                )
+
+                context = {
+                    "agent_id": agent.id,
+                    "name": agent.name,
+                    "blocker_id": blocker.id,
+                    "blocker_name": blocker.name,
+                    "blocker_inspected": inspected,
+                    "allow_talk": allow_talk,
+                    "allow_probe": allow_probe,
+                    "can_reroute": alt_path is not None,
+                    "has_alternative_path": alt_path is not None,
+                    "alternative_path_length": len(alt_path) if alt_path else None,
+                    "detour_additional_steps": (len(alt_path) - len(agent.path)) if alt_path else None,
+                    "empirical_record": empirical_summary,
+                    "current_pos": [agent.position.x, agent.position.y],
+                    "blocked_pos": [blocked_pos.x, blocked_pos.y],
+                    "active_goal": current_goal.name if current_goal else "Keines",
+                }
+
+                try:
+                    start_time = time.perf_counter()
+                    resolution = await self._cognition_provider.resolve_blockage(context)
+                    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                except Exception as err:
+                    self._logger.log(
+                        SimulationEvent(
+                            tick=current_tick,
+                            agent_id=agent.id,
+                            event_type="cognition_failed",
+                            summary=f"Kognition fehlgeschlagen für {agent.name}: {err}",
+                            payload={"incident_id": incident_id, "error": str(err)},
+                        )
+                    )
+                    agent.push_goal(
+                        Goal(
                             name="Warten (Fallback)",
                             holds_position=True,
                             remaining_ticks=2,
                             priority=ExecutionPriority.URGENT,
                             description="Kognitionsfehler Fallback",
                         )
-                        agent.push_goal(fallback_goal)
-                        return
+                    )
+                    return
 
-                    if resolution.complete_sub_goal and len(agent.goals) > 1:
-                        self._goal_service.pop_goal(agent, incident_id=incident_id)
-
-                    if resolution.new_sub_goal:
-                        self._action_executor.execute_evasion(
-                            agent=agent,
-                            partner=blocker,
-                            blocked_pos=blocked_pos,
-                            all_entities=all_entities,
-                            incident_id=incident_id,
-                            thought=resolution.thought,
-                            sub_goal_name=resolution.new_sub_goal,
+                # TOCTOU-Validierung nach Deliberation
+                if blocker.position != blocked_pos:
+                    self._logger.log(
+                        SimulationEvent(
+                            tick=current_tick,
+                            agent_id=agent.id,
+                            event_type="action_dropped_stale",
+                            summary=f"Aktion für {agent.name} verworfen: Blocker {blocker.name} hat Position ({blocked_pos.x}, {blocked_pos.y}) geräumt.",
+                            payload={"incident_id": incident_id, "blocker_id": blocker.id},
                         )
+                    )
+                    self._session_manager.reset_session(agent.id, blocker.id)
+                    return
 
-                    # TOCTOU-gesicherte Ausführung
+                if resolution.complete_sub_goal and len(agent.goals) > 1:
+                    self._goal_service.pop_goal(agent, incident_id=incident_id)
+
+                if resolution.new_sub_goal:
+                    self._action_executor.execute_evasion(
+                        agent=agent,
+                        partner=blocker,
+                        blocked_pos=blocked_pos,
+                        all_entities=all_entities,
+                        incident_id=incident_id,
+                        thought=resolution.thought,
+                        sub_goal_name=resolution.new_sub_goal,
+                    )
+                    # Agent weicht selbst aus; kein blockierender Talk-Dispatch
+                    return
+
+                if isinstance(resolution.action, TalkAction) and isinstance(blocker, Agent):
+                    target_id = resolution.action.target_agent_id
+                    if not target_id or target_id == agent.id:
+                        target_id = blocker.id
+
+                    talk_cmd = TalkCommand(
+                        source_entity_id=agent.id,
+                        target_entity_id=target_id,
+                        message=resolution.action.message,
+                        intent=resolution.action.intent,
+                    )
+                    self._interaction_dispatcher.dispatch(agent, blocker, talk_cmd)
+                    self._logger.log(
+                        SimulationEvent(
+                            tick=current_tick,
+                            agent_id=agent.id,
+                            event_type="blockage_resolved",
+                            summary=f"{agent.name} spricht {blocker.name} an via InteractionDispatcher.",
+                            payload={
+                                "incident_id": incident_id,
+                                "duration_ms": duration_ms,
+                                "action": "talk",
+                                "reason": resolution.action.reason,
+                                "internal_thought": resolution.thought,
+                            },
+                        )
+                    )
+                else:
                     self._action_executor.execute_blockage_action(
                         agent=agent,
                         blocker=blocker,
@@ -241,12 +435,8 @@ class ConflictCoordinator(IConflictCoordinator):
                         duration_ms=duration_ms,
                     )
 
-                    if isinstance(blocker, Agent):
-                        self._session_manager.mark_negotiated(agent.id, blocker.id, current_tick)
-
-                finally:
-                    if isinstance(blocker, Agent):
-                        blocker.is_listening_to_peer = False
+                if isinstance(blocker, Agent):
+                    self._session_manager.mark_negotiated(agent.id, blocker.id, current_tick)
         finally:
             agent.set_thinking(False)
 
@@ -394,16 +584,19 @@ class ConflictCoordinator(IConflictCoordinator):
             )
         )
 
-        # 3. Trajektorien ermitteln
-        traj_agent = [leader_agent.position] + list(leader_agent.path) if leader_agent.has_path else [leader_agent.position]
-        if not leader_agent.has_path and leader_agent.active_goal and leader_agent.active_goal.target_position:
-            p_agent = self._pathfinder.find_path(leader_agent.position, leader_agent.active_goal.target_position, fused_map)
+        traj_agent = [leader_agent.position] + list(leader_agent.path) if leader_agent.has_path else [
+            leader_agent.position]
+        g_agent = leader_agent.active_goal
+        if not leader_agent.has_path and g_agent and g_agent.target_position:
+            p_agent = self._pathfinder.find_path(leader_agent.position, g_agent.target_position, fused_map)
             if p_agent:
                 traj_agent = [leader_agent.position] + p_agent
 
-        traj_blocker = [leader_blocker.position] + list(leader_blocker.path) if leader_blocker.has_path else [leader_blocker.position]
-        if not leader_blocker.has_path and leader_blocker.active_goal and leader_blocker.active_goal.target_position:
-            p_blocker = self._pathfinder.find_path(leader_blocker.position, leader_blocker.active_goal.target_position, fused_map)
+        traj_blocker = [leader_blocker.position] + list(leader_blocker.path) if leader_blocker.has_path else [
+            leader_blocker.position]
+        g_blocker = leader_blocker.active_goal
+        if not leader_blocker.has_path and g_blocker and g_blocker.target_position:
+            p_blocker = self._pathfinder.find_path(leader_blocker.position, g_blocker.target_position, fused_map)
             if p_blocker:
                 traj_blocker = [leader_blocker.position] + p_blocker
 
@@ -590,4 +783,4 @@ class ConflictCoordinator(IConflictCoordinator):
         self._session_manager.mark_negotiated(leader_agent.id, leader_blocker.id, current_tick)
         self._session_manager.reset_session(agent.id, blocker.id)
         agent.set_thinking(False)
-        blocker.set_thinking = False
+        blocker.set_thinking(False)

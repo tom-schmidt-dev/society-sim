@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -13,22 +12,19 @@ from src.application.services.coordination.dialogue_history import DialogueHisto
 from src.application.services.coordination.dialogue_session_manager import DialogueSessionManager
 from src.application.services.movement.evasion_finder import EvasionFinder
 from src.application.services.cognition.goal_service import GoalService
+from src.application.services.interaction.interaction_dispatcher import InteractionDispatcher
 from src.application.simulation_engine import SimulationEngine
 from src.domain.models.agent.agent import Agent
+from src.domain.models.agent.agent_state import AgentLifecycleState
+from src.domain.models.interaction.commands import TalkCommand
 from src.domain.models.planning.cognition import (
-    AbortAction,
     BlockedResolution,
     DialogueResolution,
     EndDialogueAction,
-    InspectAction,
-    ProbeAction,
-    RerouteAction,
     TalkAction,
     WaitAction,
 )
-from src.domain.models.coordination.critical_section import CriticalSection, CriticalSectionRequest
 from src.domain.models.planning.goal import ExecutionPriority, Goal
-from src.domain.models.communication.interaction_request import InteractionRequest
 from src.domain.models.communication.message import IncomingMessage
 from src.domain.models.world.position import Position
 from src.domain.models.world.world import WorldGrid
@@ -343,9 +339,9 @@ class TestActionExecutorCriticalSections:
 class TestLLMErrorHandlingAndEdgeCases:
     @pytest.mark.asyncio
     async def test_resolve_blockage_cognition_timeout_exception(
-        self,
-        mock_logger: MagicMock,
-        mock_pathfinder: MagicMock,
+            self,
+            mock_logger: MagicMock,
+            mock_pathfinder: MagicMock,
     ) -> None:
         cognition = MagicMock(spec=ICognitionProvider)
         cognition.resolve_blockage = AsyncMock(side_effect=TimeoutError("LLM Inferenz überschritten"))
@@ -353,6 +349,7 @@ class TestLLMErrorHandlingAndEdgeCases:
         session_mgr = DialogueSessionManager(max_dialogue_turns=2)
         goal_service = GoalService(mock_logger, cognition, mock_pathfinder)
         history = DialogueHistory()
+        dispatcher = InteractionDispatcher(logger=mock_logger)
         executor = ActionExecutor(
             grid=WorldGrid(10, 10),
             logger=mock_logger,
@@ -367,17 +364,18 @@ class TestLLMErrorHandlingAndEdgeCases:
             goal_service=goal_service,
             evasion_finder=EvasionFinder(mock_pathfinder),
             action_executor=executor,
+            interaction_dispatcher=dispatcher,
             session_manager=session_mgr,
             dialogue_history=history,
             enable_deterministic_corridor=False,
         )
 
         agent = create_agent("agent_1", "Alice", Position(1, 1))
-        blocker = create_agent("agent_2", "Bob", Position(1, 2))
+        partner = create_agent("agent_2", "Bob", Position(1, 2))
         agent.path = [Position(1, 2)]
 
         agent.is_thinking = True
-        await coordinator.resolve_blockage(agent, blocker, Position(1, 2), [agent, blocker])
+        await coordinator.resolve_blockage(agent, partner, Position(1, 2), [agent, partner])
 
         assert agent.is_thinking is False
         assert agent.is_waiting_for_reply is False
@@ -447,6 +445,7 @@ class TestLLMErrorHandlingAndEdgeCases:
         session_mgr = DialogueSessionManager(max_dialogue_turns=2)
         goal_service = GoalService(mock_logger, cognition, mock_pathfinder)
         history = DialogueHistory()
+        dispatcher = InteractionDispatcher(logger=mock_logger)
         executor = ActionExecutor(
             grid=WorldGrid(10, 10),
             logger=mock_logger,
@@ -461,6 +460,7 @@ class TestLLMErrorHandlingAndEdgeCases:
             goal_service=goal_service,
             evasion_finder=EvasionFinder(mock_pathfinder),
             action_executor=executor,
+            interaction_dispatcher=dispatcher,
             session_manager=session_mgr,
             dialogue_history=history,
             enable_deterministic_corridor=False,
@@ -527,6 +527,8 @@ class TestMultiAgentCriticalSectionScenarios:
 
         engine._goal_service.pause_goal(agent_2)
         engine._goal_service.pause_goal(agent_3)
+        agent_2.clear_path()
+        agent_3.clear_path()
 
         assert agent_2.active_goal is not None
         assert agent_2.active_goal.status == "paused"
@@ -586,12 +588,13 @@ class TestMultiAgentCriticalSectionScenarios:
 
     @pytest.mark.asyncio
     async def test_interaction_queue_lazy_validation_and_dequeue_trigger(
-        self,
-        mock_logger: MagicMock,
-        mock_presenter: MagicMock,
-        mock_cognition: MagicMock,
-        mock_pathfinder: MagicMock,
+            self,
+            mock_logger: MagicMock,
+            mock_presenter: MagicMock,
+            mock_cognition: MagicMock,
+            mock_pathfinder: MagicMock,
     ) -> None:
+        """Prüft reaktive Mailbox-Zustellung und Zustandsbindung statt Legacy-Queue."""
         grid = WorldGrid(width=10, height=10)
         engine = SimulationEngine(
             grid=grid,
@@ -602,36 +605,37 @@ class TestMultiAgentCriticalSectionScenarios:
         )
 
         agent_target = create_agent("target", "TargetAgent", Position(2, 2))
+        agent_target.capabilities |= agent_target.capabilities.COMMUNICATIVE
         agent_requester = create_agent("req", "RequesterAgent", Position(2, 1))
 
         engine.register_agent(agent_target)
         engine.register_agent(agent_requester)
 
-        agent_requester.path = [Position(2, 2)]
-
-        agent_target.interaction_queue.append(
-            InteractionRequest(
-                requester_id=agent_requester.id,
-                target_id=agent_target.id,
-                blocked_pos=Position(2, 2),
-                tick=1,
-            )
+        cmd = TalkCommand(
+            source_entity_id=agent_requester.id,
+            target_entity_id=agent_target.id,
+            message="Hallo",
+            intent="request_yield",
         )
+        engine.interaction_dispatcher.dispatch(agent_requester, agent_target, cmd)
+
+        assert agent_requester.lifecycle_state == AgentLifecycleState.WAITING_FOR_PEER
+        assert len(agent_target.interaction_mailbox) == 1
 
         await engine.process_tick()
 
         logged_events = [call_args[0][0].event_type for call_args in mock_logger.log.call_args_list]
-        assert "interaction_dequeued" in logged_events
-        assert len(agent_target.interaction_queue) == 0
+        assert "interaction_pending_started" in logged_events
 
     @pytest.mark.asyncio
     async def test_interaction_queue_drops_invalid_request(
-        self,
-        mock_logger: MagicMock,
-        mock_presenter: MagicMock,
-        mock_cognition: MagicMock,
-        mock_pathfinder: MagicMock,
+            self,
+            mock_logger: MagicMock,
+            mock_presenter: MagicMock,
+            mock_cognition: MagicMock,
+            mock_pathfinder: MagicMock,
     ) -> None:
+        """Prüft, dass fremdbeschäftigte Partner sofort mit BUSY abgewiesen werden (Fail-Fast)."""
         grid = WorldGrid(width=10, height=10)
         engine = SimulationEngine(
             grid=grid,
@@ -642,22 +646,23 @@ class TestMultiAgentCriticalSectionScenarios:
         )
 
         agent_target = create_agent("target", "TargetAgent", Position(2, 2))
+        agent_target.interaction_partner_id = "other_agent"
         agent_requester = create_agent("req", "RequesterAgent", Position(8, 8))
 
         engine.register_agent(agent_target)
         engine.register_agent(agent_requester)
 
-        agent_target.interaction_queue.append(
-            InteractionRequest(
-                requester_id=agent_requester.id,
-                target_id=agent_target.id,
-                blocked_pos=Position(2, 2),
-                tick=1,
-            )
+        cmd = TalkCommand(
+            source_entity_id=agent_requester.id,
+            target_entity_id=agent_target.id,
+            message="Kann ich durch?",
+            intent="request_yield",
         )
+        res = engine.interaction_dispatcher.dispatch(agent_requester, agent_target, cmd)
 
-        await engine.process_tick()
+        assert res.success is False
+        assert res.reason == "BUSY"
+        assert agent_requester.lifecycle_state == AgentLifecycleState.IDLE
 
         logged_events = [call_args[0][0].event_type for call_args in mock_logger.log.call_args_list]
-        assert "interaction_request_dropped" in logged_events
-        assert len(agent_target.interaction_queue) == 0
+        assert "interaction_busy_rejected" in logged_events

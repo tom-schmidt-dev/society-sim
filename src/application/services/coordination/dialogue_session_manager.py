@@ -8,13 +8,14 @@ from src.domain.ports.event_logger import IEventLogger
 
 
 class DialogueSessionManager:
+    """Verwaltet Sitzungssperren, Metriken und Zusammenfassungen ohne Zwangsbegrenzung."""
+
     def __init__(
         self,
-        max_dialogue_turns: Optional[int] = None,  # None = unbegrenzt
+        max_dialogue_turns: Optional[int] = None,  # Veraltet: Keine Zwangsbegrenzung mehr
         default_lock_timeout: float = 1.5,
         logger: Optional[IEventLogger] = None,
     ) -> None:
-        self._max_dialogue_turns: Optional[int] = max_dialogue_turns
         self._default_lock_timeout: float = default_lock_timeout
         self._logger: Optional[IEventLogger] = logger
         self._conversation_locks: dict[tuple[str, ...], asyncio.Lock] = {}
@@ -30,19 +31,10 @@ class DialogueSessionManager:
         pair_key = self._get_pair_key(agent_a_id, agent_b_id)
         self._conversation_summaries[pair_key] = summary
 
-    def is_turn_limit_exceeded(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> bool:
-        if self._max_dialogue_turns is None:
-            return False
-        return self.get_turn_count(agent_a_id, agent_b_id) > self._max_dialogue_turns
-
     def reset_session(self, agent_a_id: str, agent_b_id: Optional[str] = None) -> None:
         pair_key = self._get_pair_key(agent_a_id, agent_b_id)
         self._dialogue_turns.pop(pair_key, None)
         self._conversation_summaries.pop(pair_key, None)
-
-    @property
-    def max_dialogue_turns(self) -> Optional[int]:
-        return self._max_dialogue_turns
 
     @staticmethod
     def _get_pair_key(agent_a_id: str, agent_b_id: Optional[str] = None) -> tuple[str, ...]:
@@ -65,7 +57,6 @@ class DialogueSessionManager:
         timeout: Optional[float] = None,
         tick: int = 0,
     ) -> AsyncIterator[bool]:
-        """Asynchroner Lock mit kanonischer Sortierung und Timeout-Circuit-Breaker."""
         pair_key = self._get_pair_key(agent_a_id, agent_b_id)
         if pair_key not in self._conversation_locks:
             self._conversation_locks[pair_key] = asyncio.Lock()

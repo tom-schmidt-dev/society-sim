@@ -19,6 +19,7 @@ from src.application.services.coordination.dialogue_history import DialogueHisto
 from src.domain.models.world.world import WorldGrid
 from src.domain.ports.cognition_provider import ICognitionProvider
 from src.domain.ports.event_logger import IEventLogger
+from src.domain.ports.interaction_dispatcher import IInteractionDispatcher
 from src.domain.ports.pathfinder import IPathfinder
 from src.domain.ports.presenter import IPresenter
 from src.domain.ports.vector_memory_store import IVectorMemoryStore
@@ -48,6 +49,7 @@ class ApplicationContainer:
     vector_store: IVectorMemoryStore
     memory_consolidation_service: MemoryConsolidationService
     frame_buffer: FrameBufferService
+    interaction_dispatcher: IInteractionDispatcher
 
     @classmethod
     def build(
@@ -148,8 +150,6 @@ class ApplicationContainer:
         if cognition_provider is None:
             OllamaHealthChecker.check_status(api_base=api_base, model_name=configured_model)
 
-
-
         return cls(
             engine=engine,
             grid=grid,
@@ -165,4 +165,5 @@ class ApplicationContainer:
             vector_store=vector_store,
             memory_consolidation_service=memory_consolidation_service,
             frame_buffer=frame_buffer,
+            interaction_dispatcher=engine.interaction_dispatcher,
         )

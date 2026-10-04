@@ -528,88 +528,6 @@ async def test_dialogue_retrieval_resilient_on_vector_store_failure() -> None:
     context_arg = cognition.respond_to_dialogue.call_args[0][0]
     assert context_arg["social_memories"] == []
 
-    @pytest.mark.asyncio
-    async def test_dialogue_unlimited_turns_allows_persistent_dispute(dialogue_setup) -> None:
-        # TC-DISP-01: Bei max_dialogue_turns=None greift kein Schlichter; Streit geht über Turn 2 hinaus
-        coordinator, cognition, _, _ = dialogue_setup
-        coordinator._session_manager._max_dialogue_turns = None
-
-        alice = Agent(id="1", name="Alice", position=Position(5, 5), assertiveness=0.9)
-        bob = Agent(id="2", name="Bob", position=Position(6, 5), assertiveness=0.8)
-
-        # 5 Runden künstlich hochzählen
-        for _ in range(5):
-            coordinator._session_manager.increment_turn("1", "2")
-
-        alice.receive_message(
-            IncomingMessage(
-                from_agent_id="2",
-                from_agent_name="Bob",
-                message="Ich weiche nicht aus!",
-                intent="reject",
-            )
-        )
-
-        cognition.respond_to_dialogue.return_value = DialogueResolution(
-            thought="Ich beharre auf meinem Recht.",
-            action=TalkAction(target_agent_id="2", message="Ich aber auch nicht!", reason="Beharren"),
-            negotiation_intent="reject",
-        )
-
-        await coordinator.handle_incoming_dialogue(alice, [alice, bob])
-
-        # Kognition wurde regulär befragt, kein Zwangsausweichen
-        cognition.respond_to_dialogue.assert_awaited_once()
-        assert alice.active_goal is None or "In Nische ausweichen" not in alice.active_goal.name
-        assert alice.is_thinking is False
-
-@pytest.mark.asyncio
-async def test_dialogue_sliding_window_and_summary_in_context(dialogue_setup) -> None:
-    # TC-DISP-02: Maximal 20 Nachrichten im Kontext, conversation_summary initial vorhanden
-    coordinator, cognition, session_manager, _ = dialogue_setup
-
-    alice = Agent(id="1", name="Alice", position=Position(5, 5))
-    bob = Agent(id="2", name="Bob", position=Position(6, 5))
-
-    # 25 Nachrichten in die Historie einfügen
-    for i in range(25):
-        coordinator._dialogue_history.record_dialogue(
-            tick=i,
-            sender_id="1" if i % 2 == 0 else "2",
-            sender_name="Alice" if i % 2 == 0 else "Bob",
-            recipient_id="2" if i % 2 == 0 else "1",
-            recipient_name="Bob" if i % 2 == 0 else "Alice",
-            message=f"Argument {i}",
-            intent="reject",
-        )
-
-    session_manager.set_summary("Bisheriger Streit: Beide beharren auf Durchgang.", "1", "2")
-
-    alice.receive_message(
-        IncomingMessage(
-            from_agent_id="2",
-            from_agent_name="Bob",
-            message="Argument 24",
-            intent="reject",
-        )
-    )
-
-    cognition.respond_to_dialogue.return_value = DialogueResolution(
-        thought="Weiter streiten.",
-        action=TalkAction(target_agent_id="2", message="Nein!", reason="Streit"),
-        negotiation_intent="reject",
-    )
-
-    await coordinator.handle_incoming_dialogue(alice, [alice, bob])
-
-    context_arg = cognition.respond_to_dialogue.call_args[0][0]
-    # Maximal 20 Nachrichten im gleitenden Fenster
-    assert len(context_arg["recent_dialogues"]) == 20
-    # Älteste Nachrichten (0 bis 4) wurden verdrängt, Argument 24 ist enthalten
-    assert "Argument 24" in context_arg["recent_dialogues"][-1]
-    assert "Argument 0" not in context_arg["recent_dialogues"][0]
-    # Zusammenfassung ist im Kontext präsent
-    assert context_arg["conversation_summary"] == "Bisheriger Streit: Beide beharren auf Durchgang."
 
 @pytest.mark.asyncio
 async def test_dialogue_unlimited_turns_allows_persistent_dispute(dialogue_setup) -> None:
@@ -694,6 +612,7 @@ async def test_dialogue_sliding_window_and_summary_in_context(dialogue_setup) ->
     assert "Argument 0" not in context_arg["recent_dialogues"][0]
     # Zusammenfassung ist im Kontext präsent
     assert context_arg["conversation_summary"] == "Bisheriger Streit: Beide beharren auf Durchgang."
+
 
 @pytest.mark.asyncio
 async def test_dialogue_triggers_social_reflection_and_vector_persistence(dialogue_setup) -> None:

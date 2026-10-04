@@ -47,6 +47,7 @@ class CognitionOrchestrator:
         self._snapshot_service = snapshot_service or CognitiveSnapshotService(self._need_service)
         self._tick_provider = tick_provider or (lambda: 0)
         self._latest_snapshots: dict[str, AgentCognitiveSnapshot] = {}
+        self._last_logged_snapshots: dict[str, AgentCognitiveSnapshot] = {}
 
     @property
     def latest_snapshots(self) -> list[AgentCognitiveSnapshot]:
@@ -172,16 +173,19 @@ class CognitionOrchestrator:
     def _capture_and_log_snapshot(self, agent: Agent, entities: list[WorldEntity]) -> None:
         current_tick = self._tick_provider()
         snapshot = self._snapshot_service.create_snapshot(agent, current_tick, entities)
-        prev = self._latest_snapshots.get(agent.id)
+        last_logged = self._last_logged_snapshots.get(agent.id)
 
-        # Logge bei Zustands- und Strategiewechseln oder initialem Erfassen
-        if (
-            prev is None
-            or prev.intended_strategy != snapshot.intended_strategy
-            or prev.primary_goal != snapshot.primary_goal
-            or prev.active_subgoal != snapshot.active_subgoal
-            or prev.perceived_obstacle != snapshot.perceived_obstacle
-        ):
+        has_changed = (
+            last_logged is None
+            or last_logged.dominant_need != snapshot.dominant_need
+            or last_logged.primary_goal != snapshot.primary_goal
+            or last_logged.active_subgoal != snapshot.active_subgoal
+            or last_logged.perceived_obstacle != snapshot.perceived_obstacle
+            or last_logged.intended_strategy != snapshot.intended_strategy
+            or last_logged.formatted_thought != snapshot.formatted_thought
+        )
+
+        if has_changed:
             self._logger.log(
                 SimulationEvent(
                     tick=current_tick,
@@ -191,6 +195,7 @@ class CognitionOrchestrator:
                     payload=snapshot.to_dict(),
                 )
             )
+            self._last_logged_snapshots[agent.id] = snapshot
 
         self._latest_snapshots[agent.id] = snapshot
 
